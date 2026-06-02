@@ -13,6 +13,7 @@ Set APPWORLD_ROOT (see .env.example); FLYWHEEL_KEY must be set for ctx.model to 
 """
 import argparse
 import json
+import logging
 import os
 import shutil
 import sys
@@ -28,6 +29,34 @@ from agent import solve  # noqa: E402
 PROXY_URL = os.environ.get("FLYWHEEL_URL", "https://homodeus-flywheel.fly.dev") + "/v1"
 
 
+def _setup_logging():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(name)s] %(levelname)s  %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    # Quiet down noisy third-party loggers
+    for noisy in ("sentence_transformers", "transformers", "torch", "huggingface_hub"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
+def _load_retriever():
+    try:
+        from retriever import load_retriever
+        r = load_retriever()
+        logging.getLogger("run_local").info("Local RAG retriever ready")
+        return r
+    except FileNotFoundError:
+        logging.getLogger("run_local").warning(
+            "RAG index not found — run 'python tools/build_index.py' to build it. "
+            "Falling back to search_apis."
+        )
+        return None
+    except ImportError as e:
+        logging.getLogger("run_local").warning("RAG unavailable (%s), falling back to search_apis.", e)
+        return None
+
+
 def task_ids(n):
     local = os.path.join(os.path.dirname(__file__), "substrate", "splits", "practice.txt")
     if os.path.exists(local):
@@ -37,10 +66,19 @@ def task_ids(n):
     return ids[:n]
 
 
-def run_one(tid, key, memory_dir):
+def run_one(tid, key, memory_dir, retriever=None):
+    log = logging.getLogger("run_local")
     env = AppWorldEnv(tid, experiment_name="run_local")
-    ctx = Ctx(instruction=env.instruction, proxy_url=PROXY_URL, key=key,
-              memory_dir=memory_dir, trace_file=os.environ.get("FLYWHEEL_TRACE_FILE"), env=env)
+    log.info("Task %s: %s", tid, env.instruction[:120])
+    ctx = Ctx(
+        instruction=env.instruction,
+        proxy_url=PROXY_URL,
+        key=key,
+        memory_dir=memory_dir,
+        trace_file=os.environ.get("FLYWHEEL_TRACE_FILE"),
+        env=env,
+        retriever=retriever,
+    )
     try:
         solve(ctx)
     except NotImplementedError:
@@ -54,6 +92,9 @@ def run_one(tid, key, memory_dir):
 
 
 def main():
+    _setup_logging()
+    log = logging.getLogger("run_local")
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--n", type=int, default=5)
     ap.add_argument("--memory-off", action="store_true",
@@ -62,29 +103,34 @@ def main():
 
     key = os.environ.get("FLYWHEEL_KEY", "")
     if not key:
-        print("warning: FLYWHEEL_KEY not set; ctx.model calls will fail.", file=sys.stderr)
+        log.warning("FLYWHEEL_KEY not set; ctx.model calls will fail.")
     os.environ.setdefault("APPWORLD_ROOT", os.environ.get("APPWORLD_ROOT", "./aw"))
+
+    retriever = _load_retriever()
 
     mem_root = tempfile.mkdtemp(prefix="fw_mem_")
     ids = task_ids(a.n)
-    print(f"running {len(ids)} dev tasks (memory {'OFF' if a.memory_off else 'ON'}): {ids}\n")
+    log.info("Running %d dev tasks (memory %s): %s", len(ids), "OFF" if a.memory_off else "ON", ids)
+    print()
 
     results = []
     for tid in ids:
         if a.memory_off:
             shutil.rmtree(mem_root, ignore_errors=True)
         os.makedirs(mem_root, exist_ok=True)
-        ok, verdict = run_one(tid, key, mem_root)
+        ok, verdict = run_one(tid, key, mem_root, retriever=retriever)
         if ok is None:
-            print("agent.py is still the skeleton (NotImplementedError). Implement solve(ctx), then rerun.")
+            print("agent.py not implemented yet (NotImplementedError). Implement solve(ctx) and rerun.")
             return
         results.append((tid, ok))
-        print(f"  {tid:14s} {'PASS' if ok else 'FAIL'}")
-        if not ok:  # oracle verdict so the loop is learnable: what failed and why
+        status = "PASS ✓" if ok else "FAIL ✗"
+        print(f"  {tid:14s}  {status}")
+        if not ok:
             print(f"    oracle: {json.dumps(verdict, default=str)}")
+        print()
 
     passed = sum(1 for _, ok in results if ok)
-    print(f"\nTGC: {passed}/{len(results)}  ({'memory off' if a.memory_off else 'memory on'})")
+    print(f"TGC: {passed}/{len(results)}  ({'memory off' if a.memory_off else 'memory on'})")
 
 
 if __name__ == "__main__":

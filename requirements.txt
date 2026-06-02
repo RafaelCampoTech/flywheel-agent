@@ -1,2 +1,5 @@
 # Graded runtime deps only. The SDK itself uses the Python standard library.
 # Add your agent runtime deps below.
+scikit-learn>=1.4
+numpy>=1.24
+json-repair>=0.30

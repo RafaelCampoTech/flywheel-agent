@@ -6,3 +6,6 @@ __pycache__/
 .memory/
 experiments/
 .runs/
+# Ignore raw .txt files and model cache; commit the JSON schemas and TF-IDF index
+api_docs_dump/apis/
+api_docs_dump/model/
