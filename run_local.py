@@ -146,9 +146,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--n", type=int, default=5)
     ap.add_argument("--memory-off", action="store_true",
-                    help="wipe memory between tasks (the off-arm; self-check your memory gap)")
+                    help="run with isolated tmpdir memory (off-arm baseline; does not touch memory/)")
     ap.add_argument("--verbose", "-v", action="store_true",
                     help="print oracle.why, tool_calls, and agent_log per task")
+    ap.add_argument("--memory-dir", default=None,
+                    help="override memory directory (default: memory/ inside the repo)")
     a = ap.parse_args()
 
     key = os.environ.get("FLYWHEEL_KEY", "")
@@ -156,17 +158,34 @@ def main():
         print("warning: FLYWHEEL_KEY not set; ctx.model calls will fail.", file=sys.stderr)
     os.environ.setdefault("APPWORLD_ROOT", os.environ.get("APPWORLD_ROOT", "./aw"))
 
-    mem_root = tempfile.mkdtemp(prefix="fw_mem_")
+    # Default: write to memory/ in the repo so skills persist and can be committed.
+    # --memory-off: isolated tmpdir, discarded after run (no effect on committed memory).
+    repo_memory = os.path.join(os.path.dirname(os.path.abspath(__file__)), "memory")
+    if a.memory_off:
+        mem_root = tempfile.mkdtemp(prefix="fw_mem_off_")
+        _cleanup_tmp = mem_root
+    else:
+        mem_root = a.memory_dir or repo_memory
+        os.makedirs(mem_root, exist_ok=True)
+        _cleanup_tmp = None
+
     ids = task_ids(a.n)
-    print(f"running {len(ids)} dev tasks (memory {'OFF' if a.memory_off else 'ON'}): {ids}\n")
+    print(f"running {len(ids)} dev tasks  memory={'OFF (tmpdir)' if a.memory_off else mem_root}")
+    print(f"tasks: {ids}\n")
 
     results = []
     for tid in ids:
         if a.memory_off:
-            shutil.rmtree(mem_root, ignore_errors=True)
-        os.makedirs(mem_root, exist_ok=True)
+            # Fresh tmpdir per task for true off-arm isolation
+            task_mem = tempfile.mkdtemp(prefix=f"fw_mem_off_{tid}_")
+        else:
+            task_mem = mem_root
 
-        ok, verdict, events = run_one(tid, key, mem_root, verbose=a.verbose)
+        ok, verdict, events = run_one(tid, key, task_mem, verbose=a.verbose)
+
+        if a.memory_off:
+            shutil.rmtree(task_mem, ignore_errors=True)
+
         if ok is None:
             print("agent.py is still the skeleton (NotImplementedError). Implement solve(ctx), then rerun.")
             return
@@ -178,14 +197,17 @@ def main():
         print(f"  {tid:14s}  {status}  (model={model_calls} reflect={reflects})")
 
         if not ok or a.verbose:
-            # Always show oracle.why on failure; show all four on --verbose
             _print_oracle_why(verdict)
             if a.verbose:
                 _print_tool_calls(events)
                 _print_agent_log(events)
 
+    if _cleanup_tmp:
+        shutil.rmtree(_cleanup_tmp, ignore_errors=True)
+
     passed = sum(1 for _, ok in results if ok)
-    print(f"\nTGC: {passed}/{len(results)}  ({'memory off' if a.memory_off else 'memory on'})")
+    arm = "memory off" if a.memory_off else f"memory on  →  commit memory/ to ship skills"
+    print(f"\nTGC: {passed}/{len(results)}  ({arm})")
 
 
 if __name__ == "__main__":
