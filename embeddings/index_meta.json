@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "num_docs": 457,
+  "apis_dir": "api_docs_dump/apis",
+  "index_file": "embeddings/tfidf_index.pkl",
+  "vectorizer": "sklearn.TfidfVectorizer(english, 1-2 grams)"
+}
