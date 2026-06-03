@@ -66,17 +66,34 @@ _DEFAULT_SKILLS: List[Dict[str, Any]] = [
         "tags": ["login", "bootstrap", "supervisor", "password"],
     },
     {
-        "name": "app_login_token",
+        "name": "all_app_logins",
         "apps": [],
-        "description": "Login to any app and get access_token. Phone app uses phone_number; all others use email.",
+        "description": (
+            "Exact login code for every AppWorld app. Use when access_tokens is missing a key "
+            "(e.g. KeyError: 'venmo'). All email-based except phone which uses phone_number."
+        ),
         "code": (
             "me = apis.supervisor.show_profile()\n"
             "pw = {p['account_name']: p['password'] for p in apis.supervisor.show_account_passwords()}\n"
-            "# replace APPNAME with: spotify | amazon | gmail | venmo | splitwise | todoist | simple_note | file_system\n"
-            "tok = apis.APPNAME.login(username=me['email'], password=pw['APPNAME'])['access_token']\n"
-            "# phone: username=me['phone_number']"
+            "\n"
+            "# --- email-based logins ---\n"
+            "spotify_tok     = apis.spotify.login(username=me['email'], password=pw['spotify'])['access_token']\n"
+            "amazon_tok      = apis.amazon.login(username=me['email'], password=pw['amazon'])['access_token']\n"
+            "gmail_tok       = apis.gmail.login(username=me['email'], password=pw['gmail'])['access_token']\n"
+            "venmo_tok       = apis.venmo.login(username=me['email'], password=pw['venmo'])['access_token']\n"
+            "splitwise_tok   = apis.splitwise.login(username=me['email'], password=pw['splitwise'])['access_token']\n"
+            "todoist_tok     = apis.todoist.login(username=me['email'], password=pw['todoist'])['access_token']\n"
+            "simple_note_tok = apis.simple_note.login(username=me['email'], password=pw['simple_note'])['access_token']\n"
+            "file_system_tok = apis.file_system.login(username=me['email'], password=pw['file_system'])['access_token']\n"
+            "\n"
+            "# --- phone uses phone_number, NOT email ---\n"
+            "phone_tok = apis.phone.login(username=me['phone_number'], password=pw['phone'])['access_token']\n"
         ),
-        "tags": ["login", "access_token", "auth"],
+        "tags": [
+            "login", "access_token", "all_apps",
+            "spotify", "amazon", "gmail", "venmo", "splitwise",
+            "todoist", "simple_note", "file_system", "phone",
+        ],
     },
     {
         "name": "paginated_list_all",
@@ -230,7 +247,13 @@ class SkillLibrary:
     # ------------------------------------------------------------------
 
     def search(self, query: str, apps: List[str], top_k: int = 4) -> List[Dict[str, Any]]:
-        """Return relevant skills by keyword overlap + app match. O(n_skills)."""
+        """Return relevant skills by keyword overlap + app match. O(n_skills).
+
+        Index text = name + description + tags + API method names extracted from code.
+        API method names (show_song_library, page_index, access_token …) are the best
+        signal: a task instruction that mentions "song library" or "pagination" will
+        directly overlap with the method names in a working skill's code.
+        """
         q_words = set(re.findall(r"\w+", query.lower()))
         app_set = set(apps)
 
@@ -243,10 +266,22 @@ class SkillLibrary:
         for name, apps_json, desc, code, tags_json, cnt in rows:
             skill_apps = set(json.loads(apps_json or "[]"))
             skill_tags = set(json.loads(tags_json or "[]"))
-            index_text = " ".join([name, desc] + list(skill_tags)).lower()
+
+            # Extract API method names from code (apis.app.method_name → "method_name")
+            code_methods = set(re.findall(r"apis\.\w+\.(\w+)", code or ""))
+            # Also extract bare identifiers likely to be domain terms
+            code_words = set(re.findall(r"\b([a-z][a-z_]{3,})\b", (code or "").lower()))
+
+            index_text = " ".join(
+                [name, desc]
+                + list(skill_tags)
+                + list(code_methods)
+                + list(code_words)
+            ).lower()
             s_words = set(re.findall(r"\w+", index_text))
 
-            score = len(q_words & s_words) * 2
+            overlap = len(q_words & s_words)
+            score = overlap * 2
             if skill_apps & app_set:
                 score += 6
             if not skill_apps:  # general (pagination, login) — always useful
@@ -265,6 +300,19 @@ class SkillLibrary:
 
         scored.sort(key=lambda x: x[0], reverse=True)
         return [item for _, item in scored[:top_k]]
+
+    def search_multi(self, queries: List[str], apps: List[str], top_k: int = 6) -> List[Dict[str, Any]]:
+        """Search with multiple queries and merge by best score per skill (deduped)."""
+        seen: Dict[str, int] = {}  # name -> best score index
+        merged: List[Dict[str, Any]] = []
+        for q in queries:
+            if not q or not q.strip():
+                continue
+            for s in self.search(q, apps, top_k=top_k):
+                if s["name"] not in seen:
+                    seen[s["name"]] = len(merged)
+                    merged.append(s)
+        return merged[:top_k]
 
     def similar_tasks(self, apps: List[str], task_kind: str, top_k: int = 3) -> List[Dict[str, Any]]:
         """Return recent successful tasks with overlapping apps."""
