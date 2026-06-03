@@ -25,7 +25,7 @@ APPS = [
 
 MIN_RAG_SCORE = 0.14
 RAG_FINAL_TOP_K = 1  # used by retrieve_relevant_docs (single-query path)
-_RAG_PLAN_CANDIDATES = 3  # candidates retrieved per plan step for API validation
+_RAG_PLAN_CANDIDATES = 5  # candidates retrieved per plan step for API validation
 _LOG_PREVIEW = 500
 _CODE_LOG_PREVIEW = 12000
 API_DOCS_DUMP = "api_docs_dump"
@@ -36,8 +36,10 @@ AUTH_APPS = {
 SKIP_LOGIN = {"supervisor", "api_docs"}
 MAX_PLAN_QUESTIONS = 10
 _MAX_RAG_WORKERS = 8
-_CHECK_LOOP_ATTEMPTS = 4
-MAX_REPLAN_ITERATIONS = 1  # max extra replan cycles after the first attempt
+# Configurable via env so run_benchmark.py can override before import.
+# Production defaults: 5 check attempts, 1 replan iteration.
+_CHECK_LOOP_ATTEMPTS = int(os.environ.get("FLYWHEEL_CHECK_ATTEMPTS", "5"))
+MAX_REPLAN_ITERATIONS = int(os.environ.get("FLYWHEEL_REPLAN_ITERATIONS", "1"))
 _rag_cache: Any = None
 
 
@@ -578,7 +580,14 @@ def print_plan(plan: Dict[str, Any], *, title: str = "PLAN") -> None:
 
 
 def _rag_hint_for_question(item: Dict[str, Any]) -> Dict[str, Any]:
-    """RAG + rerank + API definition for one plan question (thread-safe read on shared index)."""
+    """Cosine search for one plan question; returns top candidates for batch validation.
+
+    No per-question LLM rerank: the rerank decision is expensive and makes the same
+    choice as _validate_plan_apis_batch but with less context (200-char descriptions
+    vs full definitions). Skipping it here keeps the top-cosine candidates intact so
+    the batch validator — which sees full definitions — can make the real selection.
+    App names are prepended to the query to anchor TF-IDF scoring to the right app.
+    """
     question = (item.get("question") or "").strip()
     step = item.get("step")
     empty: Dict[str, Any] = {
@@ -594,12 +603,20 @@ def _rag_hint_for_question(item: Dict[str, Any]) -> Dict[str, Any]:
 
     from tools.rag import RAG_RETRIEVE_K
 
+    # Prepend app names not already in the question so TF-IDF scores against the
+    # correct app's docs when the question omits the app name.
+    app_prefix = " ".join(
+        a for a in (item.get("apps") or [])
+        if a.lower() not in question.lower()
+    )
+    query = f"{app_prefix} {question}".strip() if app_prefix else question
+
     docs = _get_rag().cosine_similarity_search(
-        question,
-        top_k=_RAG_PLAN_CANDIDATES,  # retrieve top-3 for API validation step
+        query,
+        top_k=_RAG_PLAN_CANDIDATES,
         min_score=MIN_RAG_SCORE,
         retrieve_k=RAG_RETRIEVE_K,
-        use_llm_rerank=True,
+        use_llm_rerank=False,  # LLM selection happens once in _validate_plan_apis_batch
         verbose=False,
     )
     results = docs.get("results") or []
@@ -614,11 +631,11 @@ def _rag_hint_for_question(item: Dict[str, Any]) -> Dict[str, Any]:
         "app": hit.get("app") if hit else None,
         "api": hit.get("api") if hit else None,
         "cosine_similarity": hit.get("cosine_similarity") if hit else None,
-        "rerank_reason": (hit.get("rerank_reason") or "") if hit else "",
+        "rerank_reason": "",
         "description": (hit.get("description") or "")[:200] if hit else "",
         "definition_text": defn.get("definition_text", ""),
         "api_definitions": defs,
-        "api_candidates": results,  # all top-_RAG_PLAN_CANDIDATES hits for validation
+        "api_candidates": results,  # top-_RAG_PLAN_CANDIDATES cosine hits for batch validation
     }
 
 
@@ -637,10 +654,15 @@ def enrich_plan_with_rag(plan: Dict[str, Any]) -> Dict[str, Any]:
     workers = min(_MAX_RAG_WORKERS, len(questions))
     hints: List[Dict[str, Any]] = []
 
+    # Inject plan apps into each question item so _rag_hint_for_question can
+    # anchor the TF-IDF query to the right app namespace.
+    task_apps = plan.get("apps") or []
+    questions_with_apps = [{**q, "apps": task_apps} for q in questions]
+
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
             pool.submit(_rag_hint_for_question, q): q.get("step")
-            for q in questions
+            for q in questions_with_apps
         }
         for fut in as_completed(futures):
             try:
@@ -670,8 +692,10 @@ def _enrich_new_questions(plan: Dict[str, Any]) -> Dict[str, Any]:
         for h in (plan.get("api_hints") or [])
         if isinstance(h, dict) and h.get("step") is not None
     }
+    task_apps = plan.get("apps") or []
     unenriched = [
-        q for q in (plan.get("questions") or [])
+        {**q, "apps": task_apps}
+        for q in (plan.get("questions") or [])
         if isinstance(q, dict) and q.get("step") not in existing_by_step
     ]
     if not unenriched:
@@ -731,19 +755,24 @@ def _validate_plan_apis_batch(ctx, plan: Dict[str, Any]) -> Dict[str, Any]:
                 "api": capi,
                 "cosine_score": c.get("cosine_similarity"),
                 "description": (c.get("description") or "")[:150],
-                "definition": (d.get("definition_text") if d else "")[:400],
+                "definition": (d.get("definition_text") if d else "")[:800],
             })
         if not candidates:
-            candidates = [{"app": hint.get("app"), "api": hint.get("api"), "definition": hint.get("definition_text", "")[:400]}]
+            candidates = [{"app": hint.get("app"), "api": hint.get("api"), "definition": hint.get("definition_text", "")[:800]}]
         items.append({"step": step, "requirement": requirement[:200], "candidates": candidates})
 
     if not items:
         return plan
 
     sys_prompt = (
-        "For each plan step, select the API that BEST satisfies the requirement.\n"
-        "Prefer: correct operation (read vs write), correct data fields, pagination support for list tasks.\n"
-        "If the primary (first) candidate fits, you can keep it.\n"
+        "For each plan step, select the API from the candidates that BEST satisfies the requirement.\n"
+        "Evaluate in this order:\n"
+        "1. Correct app — the API must belong to the app the step references.\n"
+        "2. Correct operation — read endpoints for queries, write endpoints for mutations.\n"
+        "3. Correct parameters — the API must accept the inputs the step needs.\n"
+        "4. Correct response — the API must return the fields the next step depends on.\n"
+        "5. Pagination — prefer APIs with page_index / page_limit for 'list all' steps.\n"
+        "Read the full definition (parameters + response), not just the description.\n"
         "Reply JSON: {\"selections\": [{\"step\": N, \"app\": \"...\", \"api\": \"...\", \"reason\": \"one line\"}]}"
     )
     out = _model_text(
@@ -924,9 +953,10 @@ def _oracle_gate(
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """
     Local run_local only: submit trial answer to AppWorld oracle; on mismatch regenerate.
+    Skipped when ctx._no_oracle_gate is True (benchmark / single-shot mode).
     """
     env = _local_env(ctx)
-    if env is None:
+    if env is None or getattr(ctx, "_no_oracle_gate", False):
         return run_result, solution
 
     instruction = plan.get("instruction") or ""
@@ -1661,14 +1691,14 @@ def _codegen_base_sys(plan: Dict[str, Any], ctx_data: Dict[str, Any]) -> str:
         sys += (
             "\nSet ANSWER to the exact final string the task expects, then print('ANSWER=' + ANSWER).\n"
             "ANSWER FORMAT (critical for grading):\n"
-            "- Comma-separated lists: ANSWER = \", \".join(t.strip() for t in titles)\n"
-            "  (one comma + one space between items; strip each title; no leading spaces on items)\n"
+            "- Comma-separated lists: ANSWER = \", \".join(item.strip() for item in items)\n"
+            "  (one comma + one space between items; strip each item; no leading spaces)\n"
             "- If task says 'top N', return exactly N items after sorting.\n"
-            "SPOTIFY AGGREGATION:\n"
-            "- Union song_ids from song library + album library + playlist library (all paginated).\n"
-            "- Per song_id call show_song(access_token=..., song_id=sid) for genre and play_count.\n"
-            "- R&B filter: g = (song.get('genre') or '').lower(); keep if 'r&b' in g\n"
-            "- Sort: songs.sort(key=lambda s: (-s.get('play_count', 0), s.get('title', '')))\n"
+            "AGGREGATION PATTERN (for tasks that require collecting items across multiple libraries):\n"
+            "- Union item IDs from all relevant library endpoints (all paginated).\n"
+            "- Fetch full details per item ID to access fields like genre, count, or title.\n"
+            "- Apply filters using the relevant field: (item.get('field') or '').lower()\n"
+            "- Sort by numeric fields descending, then by name ascending as tiebreaker.\n"
         )
     else:
         sys += "\nPerform required mutations; print('ANSWER=') only if the task expects a value.\n"
@@ -2154,9 +2184,10 @@ def solve(ctx):
     else:
         skill_lib.log_task(task_key, all_apps, task_kind, api_sequence, answer, success=False)
 
-    # Local-only: oracle verdict → learn corrected skills from failures
+    # Local-only: oracle verdict → learn corrected skills from failures.
+    # Skipped in benchmark mode so the agent never reads oracle feedback.
     env = _local_env(ctx)
-    if env is not None:
+    if env is not None and not getattr(ctx, "_no_oracle_gate", False):
         try:
             oracle_verdict = env.world.evaluate().to_dict()
             if not oracle_verdict.get("success"):
