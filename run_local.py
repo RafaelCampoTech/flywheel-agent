@@ -28,6 +28,20 @@ from agent import solve  # noqa: E402
 PROXY_URL = os.environ.get("FLYWHEEL_URL", "https://homodeus-flywheel.fly.dev") + "/v1"
 
 
+def _api_docs_retriever():
+    """TF-IDF over api_docs_dump/apis if index exists; else default search_apis."""
+    try:
+        from tools.rag import RAG_RETRIEVE_K, make_retriever
+
+        return make_retriever(
+            top_k=1,
+            retrieve_k=RAG_RETRIEVE_K,
+            use_llm_rerank=True,
+        )
+    except FileNotFoundError:
+        return None
+
+
 def task_ids(n):
     local = os.path.join(os.path.dirname(__file__), "substrate", "splits", "practice.txt")
     if os.path.exists(local):
@@ -39,8 +53,15 @@ def task_ids(n):
 
 def run_one(tid, key, memory_dir):
     env = AppWorldEnv(tid, experiment_name="run_local")
-    ctx = Ctx(instruction=env.instruction, proxy_url=PROXY_URL, key=key,
-              memory_dir=memory_dir, trace_file=os.environ.get("FLYWHEEL_TRACE_FILE"), env=env)
+    ctx = Ctx(
+        instruction=env.instruction,
+        proxy_url=PROXY_URL,
+        key=key,
+        memory_dir=memory_dir,
+        trace_file=os.environ.get("FLYWHEEL_TRACE_FILE"),
+        env=env,
+        retriever=_api_docs_retriever(),
+    )
     try:
         solve(ctx)
     except NotImplementedError:
