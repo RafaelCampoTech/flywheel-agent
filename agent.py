@@ -13,6 +13,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from tools.skill_library import SkillLibrary, skill_name_for
+
 # --- defaults stored in memory on first run ---
 DEFAULT_SKILLS: List[Dict[str, Any]] = [
     {
@@ -45,7 +47,15 @@ SKIP_LOGIN = {"supervisor", "api_docs"}
 MAX_PLAN_QUESTIONS = 10
 _MAX_RAG_WORKERS = 8
 _CHECK_LOOP_ATTEMPTS = 4
-_PROBE_SUMMARY_LEN = 1200
+_rag_cache: Any = None
+
+
+def _get_rag() -> Any:
+    global _rag_cache
+    if _rag_cache is None:
+        from tools.rag import ApiDocsRAG
+        _rag_cache = ApiDocsRAG()
+    return _rag_cache
 
 
 def _log(phase: str, **fields) -> None:
@@ -75,6 +85,18 @@ def _sanitize_appworld_code(code: str) -> str:
             continue
         out.append(line)
     return "\n".join(out)
+
+
+def _strip_token_preamble(code: str) -> str:
+    """Remove the injected 'access_tokens = {...}' line before saving a skill.
+    Token values are task-specific and expire; skills must use the access_tokens
+    dict that the harness provides at runtime, not hardcoded values.
+    """
+    if not code:
+        return code
+    lines = code.splitlines()
+    cleaned = [l for l in lines if not re.match(r"^access_tokens\s*=\s*\{", l)]
+    return "\n".join(cleaned).strip()
 
 
 def _model_text(ctx, messages: List[Dict[str, str]], json_mode: bool = False) -> str:
@@ -131,7 +153,6 @@ def _render_api_doc(doc: Dict[str, Any]) -> str:
 
 def fetch_api_definitions(rag_docs: Any) -> List[Dict[str, Any]]:
     """Resolve RAG hits to full API definitions from api_docs_dump/{app}.json."""
-    _log("fetch_api_definitions", source="api_docs_dump")
     dump = _api_docs_root()
     hits = rag_docs.get("results", []) if isinstance(rag_docs, dict) else []
     definitions: List[Dict[str, Any]] = []
@@ -429,7 +450,7 @@ def domain_classification(ctx) -> List[str]:
         json_mode=True,
     )
     apps = _parse_json(out).get("apps", [])
-    result = [a for a in apps if a in APPS] or ["spotify"]
+    result = [a for a in apps if a in APPS]
     _log("domain_classification", apps=result, method="model")
     return result
 
@@ -444,10 +465,10 @@ def retrieve_relevant_docs(
     _log("retrieve_relevant_docs", query=query, top_k=top_k, min_score=min_score)
 
     try:
-        from tools.rag import RAG_RETRIEVE_K, cosine_similarity_search
+        from tools.rag import RAG_RETRIEVE_K
 
         ctx.trace("retrieval", query=query, source="embeddings_tfidf", min_score=min_score)
-        docs = cosine_similarity_search(
+        docs = _get_rag().cosine_similarity_search(
             query,
             top_k=top_k,
             min_score=min_score,
@@ -487,29 +508,6 @@ def retrieve_relevant_docs(
     return docs
 
 
-def generate_query(ctx, task: str, apps: List[str]) -> str:
-    """Build a short RAG query from the task and target apps."""
-    _log("generate_query", task=task, apps=apps)
-    app_part = " ".join(apps)
-    out = _model_text(
-        ctx,
-        [
-            {
-                "role": "system",
-                "content": (
-                    "Write a short search query (max 12 words) to find AppWorld API docs. "
-                    "Reply JSON: {\"query\":\"...\"}."
-                ),
-            },
-            {"role": "user", "content": f"Task: {task}\nApps: {app_part}"},
-        ],
-        json_mode=True,
-    )
-    q = _parse_json(out).get("query", "")
-    query = q if isinstance(q, str) and q.strip() else f"{app_part} {task[:80]}"
-    _log("generate_query", query=query)
-    return query
-
 
 def retrieve_skills(ctx, apps: List[str]) -> List[Dict[str, Any]]:
     """Load skills from memory; seed defaults if empty."""
@@ -531,14 +529,6 @@ def retrieve_skills(ctx, apps: List[str]) -> List[Dict[str, Any]]:
     _log("retrieve_skills", skills=[s.get("name") for s in result if isinstance(s, dict)])
     return result
 
-
-def _summarize_probe_value(value: Any, max_len: int = _PROBE_SUMMARY_LEN) -> str:
-    if value is None:
-        return ""
-    text = json.dumps(value, ensure_ascii=False, default=str)
-    if len(text) > max_len:
-        return text[:max_len] + "..."
-    return text
 
 
 def print_plan(plan: Dict[str, Any], *, title: str = "PLAN") -> None:
@@ -605,10 +595,7 @@ def print_plan(plan: Dict[str, Any], *, title: str = "PLAN") -> None:
     print(f"{sep}\n")
 
 
-def _rag_hint_for_question(
-    item: Dict[str, Any],
-    rag: Any,
-) -> Dict[str, Any]:
+def _rag_hint_for_question(item: Dict[str, Any]) -> Dict[str, Any]:
     """RAG + rerank + API definition for one plan question (thread-safe read on shared index)."""
     question = (item.get("question") or "").strip()
     step = item.get("step")
@@ -625,7 +612,7 @@ def _rag_hint_for_question(
 
     from tools.rag import RAG_RETRIEVE_K
 
-    docs = rag.cosine_similarity_search(
+    docs = _get_rag().cosine_similarity_search(
         question,
         top_k=RAG_FINAL_TOP_K,
         min_score=MIN_RAG_SCORE,
@@ -661,16 +648,14 @@ def enrich_plan_with_rag(plan: Dict[str, Any]) -> Dict[str, Any]:
         plan["api_hints"] = []
         return plan
 
-    from tools.rag import ApiDocsRAG
-
     _log("enrich_plan_with_rag", question_count=len(questions))
-    rag = ApiDocsRAG()
+    _get_rag()  # warm cache before threading
     workers = min(_MAX_RAG_WORKERS, len(questions))
     hints: List[Dict[str, Any]] = []
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
-            pool.submit(_rag_hint_for_question, q, rag): q.get("step")
+            pool.submit(_rag_hint_for_question, q): q.get("step")
             for q in questions
         }
         for fut in as_completed(futures):
@@ -691,6 +676,38 @@ def enrich_plan_with_rag(plan: Dict[str, Any]) -> Dict[str, Any]:
             api=f"{h.get('app')}.{h.get('api')}" if h.get("app") else None,
             score=h.get("cosine_similarity"),
         )
+    return plan
+
+
+def _enrich_new_questions(plan: Dict[str, Any]) -> Dict[str, Any]:
+    """RAG-enrich only questions that don't already have an api_hint (avoids redundant fetches)."""
+    existing_by_step = {
+        h.get("step"): h
+        for h in (plan.get("api_hints") or [])
+        if isinstance(h, dict) and h.get("step") is not None
+    }
+    unenriched = [
+        q for q in (plan.get("questions") or [])
+        if isinstance(q, dict) and q.get("step") not in existing_by_step
+    ]
+    if not unenriched:
+        return plan
+
+    _get_rag()
+    workers = min(_MAX_RAG_WORKERS, len(unenriched))
+    new_hints: List[Dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_rag_hint_for_question, q): q.get("step") for q in unenriched}
+        for fut in as_completed(futures):
+            try:
+                new_hints.append(fut.result())
+            except Exception as exc:
+                new_hints.append({"step": futures[fut], "error": str(exc)})
+
+    all_hints = list(existing_by_step.values()) + new_hints
+    all_hints.sort(key=lambda h: (h.get("step") is None, h.get("step", 0)))
+    plan["api_hints"] = all_hints
+    _log("_enrich_new_questions", new_hints=len(new_hints))
     return plan
 
 
@@ -830,10 +847,9 @@ def _oracle_gate(
             plan,
             check_feedback=(
                 f"AppWorld oracle rejected the submitted answer.\n{feedback}\n"
-                "Recompute from ALL library sources with full pagination. "
-                "Filter genre with: g = (song.get('genre') or '').lower(); "
-                "'r&b' in g. Sort by (-play_count, title). "
-                "Format: ANSWER = \", \".join(t.strip() for t in titles)"
+                "Recompute carefully from scratch. Ensure full pagination on all list APIs. "
+                "Verify all field names match the API response schema before indexing. "
+                "Format ANSWER exactly as the task requires (correct items, correct order, correct separators)."
             ),
             failed_code=solution.get("code", ""),
         )
@@ -898,54 +914,183 @@ def verify_solution(
     }
 
 
+def _reflect_and_revise(
+    ctx,
+    plan: Dict[str, Any],
+    failed_code: str,
+    feedback: str,
+    run_result: Dict[str, Any],
+) -> Tuple[Dict[str, Any], str, bool]:
+    """
+    Reflect on a failed attempt: analyze plan + executed code + error to decide
+    whether the plan itself needs changing or only the code does.
+
+    Returns (revised_plan, diagnosis, plan_was_changed).
+    """
+    sys = (
+        "You are reflecting on a failed AppWorld agent attempt.\n"
+        "Analyze the task plan, the code that ran, and the error/feedback.\n"
+        "Determine: is this a CODE error (wrong API name, missing token, bad params, "
+        "wrong field key) or a PLAN error (wrong approach, missing step, wrong app)?\n"
+        "\n"
+        "- CODE error → return plan_changed=false and a concise diagnosis of the exact fix.\n"
+        "- PLAN error → return plan_changed=true and a revised questions list.\n"
+        "\n"
+        "Only change the plan when truly necessary. Prefer the minimal fix.\n"
+        "Reply JSON only:\n"
+        "{\n"
+        '  "diagnosis": "precise description of what failed and how to fix it",\n'
+        '  "plan_changed": false,\n'
+        '  "questions": []  // only populated when plan_changed=true\n'
+        "}"
+    )
+    user = {
+        "task_instruction": plan.get("instruction"),
+        "task_kind": plan.get("task_kind"),
+        "apps": plan.get("apps"),
+        "current_plan": [
+            {"step": q.get("step"), "kind": q.get("kind"), "question": q.get("question")}
+            for q in plan.get("questions", [])
+        ],
+        "api_hints_used": [
+            f"{h.get('app')}.{h.get('api')}" for h in plan.get("api_hints", []) if h.get("app")
+        ],
+        "failed_code": _feedback_str(failed_code, max_len=1500),
+        "error_or_feedback": _feedback_str(feedback, max_len=800),
+        "stdout_tail": _feedback_str((run_result.get("stdout") or "")[-400:]),
+    }
+    out = _model_text(
+        ctx,
+        [{"role": "system", "content": sys}, {"role": "user", "content": json.dumps(user, ensure_ascii=False)}],
+        json_mode=True,
+    )
+    parsed = _parse_json(out)
+    diagnosis = parsed.get("diagnosis", "")
+    plan_changed = bool(parsed.get("plan_changed"))
+    _log("_reflect_and_revise", plan_changed=plan_changed, diagnosis=diagnosis[:300])
+
+    if plan_changed:
+        new_questions = parsed.get("questions") or []
+        if isinstance(new_questions, list) and new_questions:
+            normalized: List[Dict[str, Any]] = []
+            for i, s in enumerate(new_questions, start=1):
+                if not isinstance(s, dict):
+                    continue
+                q = (s.get("question") or "").strip()
+                if not q:
+                    continue
+                normalized.append({
+                    "step": s.get("step", i),
+                    "kind": s.get("kind", "question"),
+                    "question": q,
+                    "status": "pending",
+                })
+            if normalized:
+                plan = dict(plan)
+                plan["questions"] = normalized[:MAX_PLAN_QUESTIONS]
+                # RAG-enrich only the new steps (reuse hints for unchanged steps)
+                plan = _enrich_new_questions(plan)
+                print_plan(plan, title="REVISED PLAN")
+            else:
+                plan_changed = False
+
+    return plan, diagnosis, plan_changed
+
+
 def check_loop(
     ctx,
     plan: Dict[str, Any],
     *,
     max_attempts: int = _CHECK_LOOP_ATTEMPTS,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """Generate code, execute, verify — retry with feedback until pass or max attempts."""
+    """
+    Generate code → execute → reflect on plan+code+error → revise plan if needed → retry.
+    API definitions are only re-fetched when the plan introduces APIs not already loaded.
+    """
     solution = generate_solution_code(ctx, plan)
     run_result: Dict[str, Any] = {"ok": False, "answer": ""}
 
+    # Track which (app, api) definitions are already in the plan to avoid redundant fetches
+    fetched_api_keys: set = {
+        (h.get("app"), h.get("api")) for h in plan.get("api_hints", []) if h.get("app")
+    }
+
     for attempt in range(1, max_attempts + 1):
         run_result = execute_code(ctx, solution.get("code", ""), attempt=attempt)
-        if not run_result.get("ok"):
-            feedback = run_result.get("error") or run_result.get("stdout", "")
-            passed = False
-        else:
+
+        if run_result.get("ok"):
             verdict = verify_solution(ctx, plan, run_result)
             passed = verdict.get("pass", False)
             feedback = verdict.get("reason", "")
+        else:
+            passed = False
+            feedback = run_result.get("error") or run_result.get("stdout", "")
 
         fb = _feedback_str(feedback, max_len=200)
         _log("check_loop", attempt=attempt, passed=passed, feedback=fb)
         if passed:
             break
 
-        ctx.reflect(f"check_loop attempt {attempt}: {fb or 'failed'}")
+        ctx.reflect(
+            f"check_loop attempt {attempt}: "
+            f"{'exec failed' if not run_result.get('ok') else 'answer invalid'}: {fb[:120]}"
+        )
+
+        # --- Reflect: diagnose plan vs code error, possibly revise plan ---
+        plan, diagnosis, plan_changed = _reflect_and_revise(
+            ctx, plan, solution.get("code", ""), feedback, run_result
+        )
+
+        # --- Fetch API docs only when needed ---
+        if not run_result.get("ok"):
+            current_keys = {
+                (h.get("app"), h.get("api")) for h in plan.get("api_hints", []) if h.get("app")
+            }
+            need_new_docs = bool(current_keys - fetched_api_keys) or plan_changed
+
+            if need_new_docs:
+                existing_defs = [
+                    {"app": h.get("app"), "api": h.get("api"), "definition_text": h.get("definition_text", "")}
+                    for h in plan.get("api_hints", [])
+                    if h.get("app") and (h.get("app"), h.get("api")) in fetched_api_keys
+                ]
+                synthetic_step = {
+                    "instruction": plan.get("instruction", ""),
+                    "doc_query": plan.get("instruction", ""),
+                }
+                new_defs, error_diagnosis = fetch_docs_for_error(
+                    ctx, _feedback_str(feedback), plan.get("apps", []), synthetic_step, existing_defs
+                )
+                for d in new_defs:
+                    key = (d.get("app"), d.get("api"))
+                    if key not in fetched_api_keys and d.get("app"):
+                        defn = d.get("definition_text", "")
+                        plan.setdefault("api_hints", []).append({
+                            "step": None,
+                            "question": "",
+                            "suggested_api": f"{d.get('app')}.{d.get('api')}",
+                            "definition_text": defn,
+                            "paginated": _endpoint_has_pagination(defn),
+                            "rerank_reason": "error-recovery",
+                        })
+                        fetched_api_keys.add(key)
+                if not diagnosis:
+                    diagnosis = error_diagnosis
+            else:
+                _log("check_loop", skip_doc_fetch="same APIs already loaded")
+
+            fetched_api_keys |= current_keys
+
         solution = generate_solution_code(
             ctx,
             plan,
             last_error=_feedback_str(feedback),
             failed_code=solution.get("code", ""),
-            check_feedback=_feedback_str(feedback, max_len=600),
+            check_feedback=_feedback_str(diagnosis or feedback, max_len=600),
         )
 
     return run_result, solution
 
-
-def _probe_record(item: Dict[str, Any], outcome: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "step": item.get("step"),
-        "kind": item.get("kind"),
-        "question": item.get("question"),
-        "app": outcome.get("app"),
-        "api": outcome.get("api"),
-        "ok": outcome.get("ok"),
-        "result_summary": _summarize_probe_value(outcome.get("result")),
-        "error": (outcome.get("error") or "")[:400],
-    }
 
 
 def build_plan(
@@ -954,6 +1099,8 @@ def build_plan(
     apps: List[str],
     skills: List[Dict[str, Any]],
     access_tokens: Optional[Dict[str, str]] = None,
+    prior_plans: Optional[List[Dict[str, Any]]] = None,
+    relevant_skills: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Build an ordered list of sub-questions/actions to probe via question_to_api."""
     _log("build_plan", task_kind=task_kind, apps=apps)
@@ -966,6 +1113,8 @@ def build_plan(
         "Use kind=question for read/probe steps, kind=action for a single mutation step.\n"
         "Do NOT include a final formatting step — synthesis happens after all probes.\n"
         "Keep the plan short (3-8 items). Be specific about apps and data needed.\n"
+        "If memory_skills or proven_plans are provided, reuse their API call sequence "
+        "as a starting point — avoid rediscovering what already worked.\n"
         "Reply JSON only:\n"
         "{\n"
         '  "questions": [\n'
@@ -974,13 +1123,24 @@ def build_plan(
         "  ]\n"
         "}"
     )
-    user = {
+    user: Dict[str, Any] = {
         "task_instruction": ctx.instruction,
         "task_kind": task_kind,
         "apps": apps,
         "skills": skills,
         "access_tokens_available": list((access_tokens or {}).keys()),
+        "proven_plans": prior_plans or [],
     }
+    if relevant_skills:
+        user["memory_skills"] = [
+            {
+                "name": s["name"],
+                "description": s["description"],
+                "api_sequence_hint": s.get("code", "")[:300],
+                "success_count": s.get("success_count", 1),
+            }
+            for s in relevant_skills
+        ]
     out = _model_text(
         ctx,
         [{"role": "system", "content": sys}, {"role": "user", "content": json.dumps(user)}],
@@ -1022,7 +1182,6 @@ def build_plan(
         "questions": normalized[:MAX_PLAN_QUESTIONS],
         "api_hints": [],
         "probes": [],
-        "ready_for_synthesis": True,
     }
     _log("build_plan", question_count=len(normalized))
     plan = enrich_plan_with_rag(plan)
@@ -1030,130 +1189,6 @@ def build_plan(
     return plan
 
 
-def refine_plan(
-    ctx,
-    plan: Dict[str, Any],
-    last_probe: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """Update remaining plan items based on probe results."""
-    _log("refine_plan", last_ok=last_probe.get("ok") if last_probe else None)
-
-    pending = [q for q in plan.get("questions", []) if q.get("status") == "pending"]
-    if not pending and not last_probe:
-        plan["ready_for_synthesis"] = True
-        return plan
-
-    sys = (
-        "You refine an AppWorld task plan after executing sub-questions via API probes.\n"
-        "Given the original task, completed probes (with API results), and pending questions:\n"
-        "- Mark ready_for_synthesis=true when enough data was collected to write final code.\n"
-        "- Otherwise return an updated questions list (pending items only, or replacements).\n"
-        "- Add new questions if a probe failed or exposed missing data.\n"
-        "- Remove redundant questions already answered by prior probes.\n"
-        "Reply JSON only:\n"
-        "{\n"
-        '  "ready_for_synthesis": false,\n'
-        '  "questions": [{"step": 3, "kind": "question", "question": "..."}],\n'
-        '  "notes": "short reason"\n'
-        "}"
-    )
-    user = {
-        "task_instruction": plan.get("instruction"),
-        "task_kind": plan.get("task_kind"),
-        "apps": plan.get("apps"),
-        "completed_probes": plan.get("probes", []),
-        "pending_questions": pending,
-        "last_probe": last_probe,
-    }
-    out = _model_text(
-        ctx,
-        [{"role": "system", "content": sys}, {"role": "user", "content": json.dumps(user, ensure_ascii=False)}],
-        json_mode=True,
-    )
-    parsed = _parse_json(out)
-    if parsed.get("ready_for_synthesis"):
-        plan["ready_for_synthesis"] = True
-        for q in plan.get("questions", []):
-            if q.get("status") == "pending":
-                q["status"] = "skipped"
-        _log("refine_plan", ready_for_synthesis=True, notes=parsed.get("notes", ""))
-        return plan
-
-    new_items = parsed.get("questions") or []
-    if isinstance(new_items, list) and new_items:
-        done_steps = {p.get("step") for p in plan.get("probes", [])}
-        max_step = max((q.get("step", 0) for q in plan.get("questions", [])), default=0)
-        refreshed: List[Dict[str, Any]] = [
-            q for q in plan.get("questions", []) if q.get("status") != "pending"
-        ]
-        for s in new_items:
-            if not isinstance(s, dict):
-                continue
-            qtext = (s.get("question") or "").strip()
-            if not qtext:
-                continue
-            step = s.get("step")
-            if not step or step in done_steps:
-                max_step += 1
-                step = max_step
-            refreshed.append(
-                {
-                    "step": step,
-                    "kind": s.get("kind", "question"),
-                    "question": qtext,
-                    "status": "pending",
-                }
-            )
-        plan["questions"] = refreshed[:MAX_PLAN_QUESTIONS]
-        _log("refine_plan", pending_count=sum(1 for q in refreshed if q.get("status") == "pending"))
-    return plan
-
-
-def run_question_plan(ctx, plan: Dict[str, Any]) -> Dict[str, Any]:
-    """Execute each plan question via question_to_api; refine after each probe."""
-    tokens = dict(plan.get("access_tokens") or {})
-    probes: List[Dict[str, Any]] = list(plan.get("probes") or [])
-
-    while True:
-        pending = [q for q in plan.get("questions", []) if q.get("status") == "pending"]
-        if plan.get("ready_for_synthesis") or not pending:
-            break
-        if len(probes) >= MAX_PLAN_QUESTIONS:
-            _log("run_question_plan", warning="max probes reached")
-            break
-
-        item = pending[0]
-        step_num = item.get("step")
-        question = item.get("question", "")
-        _log("run_question_plan", step=step_num, question=question)
-
-        from tools.question_to_api import question_to_api_call_ctx
-
-        outcome = question_to_api_call_ctx(ctx, question, tokens, verbose=False)
-        _log("run_question_plan", step=step_num, probe_code=outcome.get("code") or "")
-        item["status"] = "done" if outcome.get("ok") else "failed"
-
-        probe_entry = _probe_record(item, outcome)
-        probe_entry["definition_text"] = ""
-        defs = outcome.get("api_definitions") or []
-        if defs:
-            probe_entry["definition_text"] = (defs[0].get("definition_text") or "")[:800]
-        probes.append(probe_entry)
-        plan["probes"] = probes
-
-        if not outcome.get("ok"):
-            ctx.reflect(f"probe step {step_num} failed: {question[:80]}")
-        else:
-            _log(
-                "run_question_plan",
-                step=step_num,
-                api=f"{outcome.get('app')}.{outcome.get('api')}",
-                result_preview=probe_entry.get("result_summary", "")[:200],
-            )
-
-        plan = refine_plan(ctx, plan, last_probe=probe_entry)
-
-    return {"probes": probes, "plan": plan}
 
 
 def generate_solution_code(
@@ -1207,6 +1242,13 @@ def generate_solution_code(
     )
     if paginated_apis:
         sys += f"\nPaginated APIs in this plan (must loop): {', '.join(paginated_apis)}\n"
+    relevant_skills = plan.get("relevant_skills") or []
+    if relevant_skills:
+        sys += "\n\nSkills from memory (proven patterns — adapt if applicable):\n"
+        for s in relevant_skills:
+            sys += f"\n--- {s['name']} (success_count={s['success_count']}) ---\n"
+            sys += f"{s['description']}\n"
+            sys += f"{s['code'][:800]}\n"
     err_text = _feedback_str(last_error)
     if err_text:
         sys += (
@@ -1258,172 +1300,6 @@ def generate_solution_code(
     return {"code": full_code}
 
 
-def generate_code_for_step(
-    ctx,
-    plan: Dict[str, Any],
-    step: Dict[str, Any],
-    step_index: int,
-    api_definitions: List[Dict[str, Any]],
-    prior_steps: List[Dict[str, Any]],
-    last_error: str = "",
-    diagnosis: str = "",
-    failed_attempts: Optional[List[Dict[str, Any]]] = None,
-) -> Dict[str, Any]:
-    """Generate Python for a single plan step using step docs + full plan context."""
-    step_num = step.get("step", step_index + 1)
-    _log(
-        "generate_code_for_step",
-        step=step_num,
-        instruction=step.get("instruction"),
-        is_retry=bool(last_error),
-    )
-
-    is_last = step_index == len(plan.get("steps", [])) - 1
-    sys = (
-        "Write Python for ONE step of a multi-step AppWorld plan. Variable `apis` is in scope.\n"
-        "Do NOT call apis.supervisor.complete_task().\n"
-        "Implement ONLY the current step. You MUST use api_definitions for exact API names and parameters.\n"
-        "Never guess method names (use show_profile not get_profile).\n"
-        "access_tokens dict is provided — use access_tokens['spotify'] etc.; do not re-login if token exists.\n"
-        "Paginate list APIs with page_index until a short/empty page.\n"
-        "For writes: read current state first; only apply missing changes (idempotent).\n"
-        "Print useful debug output. Store intermediate results in variables.\n"
-    )
-    if last_error:
-        sys += (
-            "\nA previous attempt FAILED. Read diagnosis and api_definitions. "
-            "Fix the specific API mistake — do NOT repeat the same calls or identical code.\n"
-        )
-    if is_last and plan.get("task_kind") == "question":
-        sys += "This is the LAST step: set ANSWER to the final concise answer string and print('ANSWER=' + ANSWER).\n"
-    elif is_last:
-        sys += "This is the LAST step: perform any final mutations; set ANSWER='' unless you must print a value.\n"
-    else:
-        sys += "This is NOT the last step: do NOT set ANSWER unless needed for the next step; print key results.\n"
-    sys += 'Reply JSON: {"code":"..."}.'
-
-    user = {
-        "full_task": plan.get("instruction"),
-        "task_kind": plan.get("task_kind"),
-        "apps": plan.get("apps"),
-        "all_steps": plan.get("steps"),
-        "current_step": step,
-        "prior_step_results": prior_steps,
-        "api_definitions": api_definitions,
-        "access_tokens": plan.get("access_tokens"),
-        "last_error": last_error,
-        "diagnosis": diagnosis,
-        "failed_attempts": failed_attempts or [],
-    }
-    out = _model_text(
-        ctx,
-        [{"role": "system", "content": sys}, {"role": "user", "content": json.dumps(user, ensure_ascii=False)}],
-        json_mode=True,
-    )
-    parsed = _parse_json(out)
-    code = parsed.get("code", "")
-    tokens_literal = json.dumps(plan.get("access_tokens") or {})
-    preamble = f"access_tokens = {tokens_literal}\n"
-    full_code = preamble + code if code else ""
-    _log("generate_code_for_step", step=step_num, code_len=len(full_code))
-    return {"code": full_code, "step": step_num}
-
-
-def execute_plan(ctx, plan: Dict[str, Any]) -> Dict[str, Any]:
-    """Run each plan step: RAG + fetch defs + generate code + execute."""
-    steps = plan.get("steps") or []
-    _log("execute_plan", total_steps=len(steps))
-
-    prior_steps: List[Dict[str, Any]] = []
-    final_answer = ""
-    all_ok = True
-
-    for idx, step in enumerate(steps):
-        step_num = step.get("step", idx + 1)
-        _log("execute_plan", running_step=step_num, instruction=step.get("instruction"))
-
-        api_definitions: List[Dict[str, Any]] = []
-        if step.get("needs_docs", True):
-            query = step.get("doc_query") or step.get("instruction", "")
-            rag_docs = retrieve_relevant_docs(ctx, query)
-            api_definitions = fetch_api_definitions(rag_docs)
-        else:
-            _log("execute_plan", step=step_num, skip_docs=True)
-
-        max_tries = 3
-        last_error = ""
-        diagnosis = ""
-        failed_attempts: List[Dict[str, Any]] = []
-        tried_fingerprints: set = set()
-        result: Dict[str, Any] = {"ok": False, "stdout": "", "answer": ""}
-
-        for attempt in range(1, max_tries + 1):
-            code_bundle = generate_code_for_step(
-                ctx,
-                plan,
-                step,
-                idx,
-                api_definitions,
-                prior_steps,
-                last_error=last_error,
-                diagnosis=diagnosis,
-                failed_attempts=failed_attempts,
-            )
-            code = code_bundle.get("code", "")
-            fp = _code_fingerprint(code)
-
-            if fp in tried_fingerprints:
-                _log("execute_plan", step=step_num, blocked="duplicate_code", attempt=attempt)
-                last_error = (
-                    "Blocked: generated code is identical to a failed attempt. "
-                    "Change API calls to match api_definitions."
-                )
-                api_definitions, diagnosis = fetch_docs_for_error(
-                    ctx, last_error, plan.get("apps", []), step, api_definitions
-                )
-                failed_attempts.append(
-                    {"attempt": attempt, "blocked": "duplicate", "error": last_error[:300]}
-                )
-                continue
-
-            tried_fingerprints.add(fp)
-            result = execute_code(ctx, code, attempt=step_num)
-            if result.get("ok"):
-                break
-
-            last_error = result.get("error") or result.get("stdout", "")[:1500]
-            failed_attempts.append(
-                {
-                    "attempt": attempt,
-                    "error": last_error[:500],
-                    "code_preview": code[:400],
-                }
-            )
-            ctx.reflect(f"step {step_num} attempt {attempt} failed; fetching API docs for fix")
-
-            api_definitions, diagnosis = fetch_docs_for_error(
-                ctx, last_error, plan.get("apps", []), step, api_definitions
-            )
-            _log("execute_plan", step=step_num, retry=attempt + 1, docs_loaded=len(api_definitions))
-
-        if not result.get("ok"):
-            all_ok = False
-
-        if result.get("answer"):
-            final_answer = result["answer"]
-
-        prior_steps.append(
-            {
-                "step": step_num,
-                "instruction": step.get("instruction"),
-                "ok": result.get("ok"),
-                "stdout_tail": (result.get("stdout") or "")[-600:],
-                "answer": result.get("answer", ""),
-            }
-        )
-        _log("execute_plan", step=step_num, ok=result.get("ok"), answer=result.get("answer"))
-
-    return {"ok": all_ok, "answer": final_answer, "step_outputs": prior_steps}
 
 
 def execute_code(ctx, code: str, attempt: int = 1) -> Dict[str, Any]:
@@ -1477,10 +1353,32 @@ def solve(ctx):
 
     task_kind = task_classification(ctx)
     apps = domain_classification(ctx)
-
     access_tokens = bootstrap_access_tokens(ctx, apps)
     skills = retrieve_skills(ctx, apps)
-    plan = build_plan(ctx, task_kind, apps, skills, access_tokens=access_tokens)
+
+    # --- GBrain: open persistent skill library ---
+    skill_lib = SkillLibrary(ctx.memory.dir)
+    relevant_skills = skill_lib.search(instruction, apps, top_k=4)
+    similar_tasks = skill_lib.similar_tasks(apps, task_kind, top_k=3)
+    _log("solve", skills_retrieved=len(relevant_skills), similar_tasks=len(similar_tasks))
+
+    # Pull prior plan structures from the JSON wins index
+    mem = ctx.memory.read() or {}
+    wins = mem.get("wins", {}) if isinstance(mem, dict) else {}
+    prior_plans = [
+        v for v in (wins.values() if isinstance(wins, dict) else [])
+        if any(a in v.get("apps", []) for a in apps)
+    ][:3]
+
+    plan = build_plan(
+        ctx, task_kind, apps, skills,
+        access_tokens=access_tokens,
+        prior_plans=prior_plans,
+        relevant_skills=relevant_skills,
+    )
+    # Attach skills so generate_solution_code also injects them into the code-gen prompt
+    plan["relevant_skills"] = relevant_skills
+    plan["similar_tasks"] = similar_tasks
 
     run_result, solution = check_loop(ctx, plan)
     if _local_env(ctx) is not None:
@@ -1495,14 +1393,44 @@ def solve(ctx):
 
     _submit(ctx, task_kind, answer)
 
-    if run_result.get("ok") and answer:
-        mem = ctx.memory.read() or {}
-        wins = mem.get("wins", {})
+    api_sequence = [
+        f"{h.get('app')}.{h.get('api')}"
+        for h in plan.get("api_hints", [])
+        if h.get("app")
+    ]
+    key = re.sub(r"\s+", " ", instruction.lower())[:100]
+
+    if run_result.get("ok"):
+        # Save working code as a reusable skill (strip expired token preamble first)
+        code = _strip_token_preamble(solution.get("code", ""))
+        if code:
+            sname = skill_name_for(instruction, apps)
+            skill_lib.add_skill(
+                name=sname,
+                apps=apps,
+                description=instruction[:200],
+                code=code[:1500],
+                tags=[task_kind] + apps,
+            )
+            _log("solve", skill_saved=sname)
+
+        skill_lib.log_task(key, apps, task_kind, api_sequence, answer, success=True)
+
+        # Keep JSON wins index for build_plan prior_plans
+        wins = mem.get("wins", {}) if isinstance(mem, dict) else {}
         if not isinstance(wins, dict):
             wins = {}
-        key = re.sub(r"\s+", " ", instruction.lower())[:100]
-        wins[key] = {"apps": apps, "task_kind": task_kind}
+        wins[key] = {
+            "apps": apps,
+            "task_kind": task_kind,
+            "questions": [q.get("question") for q in plan.get("questions", [])[:5]],
+            "api_sequence": api_sequence,
+        }
         ctx.memory.write("wins", wins)
         _log("solve", memory_write="wins", key=key)
+    else:
+        # Log failures too — useful for pattern analysis
+        skill_lib.log_task(key, apps, task_kind, api_sequence, answer, success=False)
 
+    skill_lib.close()
     _log("solve", status="finished")
