@@ -38,7 +38,7 @@ MAX_PLAN_QUESTIONS = 10
 _MAX_RAG_WORKERS = 8
 # Configurable via env so run_benchmark.py can override before import.
 # Production defaults: 5 check attempts, 1 replan iteration.
-_CHECK_LOOP_ATTEMPTS = int(os.environ.get("FLYWHEEL_CHECK_ATTEMPTS", "5"))
+_CHECK_LOOP_ATTEMPTS = int(os.environ.get("FLYWHEEL_CHECK_ATTEMPTS", "3"))
 MAX_REPLAN_ITERATIONS = int(os.environ.get("FLYWHEEL_REPLAN_ITERATIONS", "1"))
 _rag_cache: Any = None
 
@@ -725,14 +725,12 @@ def _endpoint_has_pagination(definition_text: str) -> bool:
     return "page_index" in t or "page_limit" in t
 
 
-def _validate_plan_apis_batch(ctx, plan: Dict[str, Any]) -> Dict[str, Any]:
+def _validate_apis_and_build_code_plan(ctx, plan: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
     """
-    One-shot LLM call: for each plan step, pick the best API from its RAG candidates.
+    Single LLM call that selects the best API per step AND produces a code plan.
 
-    The RAG LLM rerank already chose the top-1, but it only saw descriptions.
-    Here we show the full definition_text for all top-3 candidates and let the model
-    pick the one that actually satisfies the step requirement (correct op, correct fields,
-    pagination if needed). Replaces wrong-API-name errors before any code is generated.
+    Replaces two sequential calls (_validate_plan_apis_batch + _build_code_plan) with one.
+    Output: updated plan with corrected api_hints, plus a code_plan string.
     """
     hints = plan.get("api_hints") or []
     questions_by_step = {q.get("step"): q for q in plan.get("questions", []) if isinstance(q, dict)}
@@ -761,32 +759,42 @@ def _validate_plan_apis_batch(ctx, plan: Dict[str, Any]) -> Dict[str, Any]:
             candidates = [{"app": hint.get("app"), "api": hint.get("api"), "definition": hint.get("definition_text", "")[:800]}]
         items.append({"step": step, "requirement": requirement[:200], "candidates": candidates})
 
-    if not items:
-        return plan
+    hints_ctx = _api_hints_context(plan)
 
     sys_prompt = (
-        "For each plan step, select the API from the candidates that BEST satisfies the requirement.\n"
-        "Evaluate in this order:\n"
-        "1. Correct app — the API must belong to the app the step references.\n"
-        "2. Correct operation — read endpoints for queries, write endpoints for mutations.\n"
-        "3. Correct parameters — the API must accept the inputs the step needs.\n"
-        "4. Correct response — the API must return the fields the next step depends on.\n"
-        "5. Pagination — prefer APIs with page_index / page_limit for 'list all' steps.\n"
-        "Read the full definition (parameters + response), not just the description.\n"
-        "Reply JSON: {\"selections\": [{\"step\": N, \"app\": \"...\", \"api\": \"...\", \"reason\": \"one line\"}]}"
+        "You have two tasks. Reply JSON with both fields.\n"
+        "\n"
+        "TASK 1 — API selection: for each plan step, select the API from the candidates that BEST satisfies the requirement.\n"
+        "Evaluate: correct app, correct operation (read vs write), correct parameters, correct response fields, pagination for 'list all' steps.\n"
+        "Read the full definition, not just the description.\n"
+        "\n"
+        "TASK 2 — Code plan: write a technical implementation brief for generating AppWorld Python code.\n"
+        "Include: exact API call sequence, which APIs need page_index loops, auth/token requirements "
+        "(email vs phone_number), data transformations (filters, sorts, field names), ANSWER format.\n"
+        "Be specific about field names. This goes directly to code generation.\n"
+        "\n"
+        'Reply JSON: {"selections": [{"step": N, "app": "...", "api": "...", "reason": "one line"}], "code_plan": "..."}'
     )
+    user = {
+        "task_instruction": plan.get("instruction"),
+        "task_kind": plan.get("task_kind"),
+        "execution_steps": [q.get("question") for q in plan.get("questions", [])],
+        "steps_with_candidates": items,
+        "api_hints": hints_ctx[:8],
+    }
     out = _model_text(
         ctx,
         [
             {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": json.dumps({"steps": items}, ensure_ascii=False)},
+            {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
         ],
         json_mode=True,
     )
     parsed = _parse_json(out)
+
+    # Apply API selections
     raw_sels = parsed.get("selections") or parsed.get("results") or []
     selections = {s.get("step"): s for s in raw_sels if isinstance(s, dict)}
-
     updated: List[Dict[str, Any]] = []
     for hint in hints:
         if not isinstance(hint, dict):
@@ -800,7 +808,7 @@ def _validate_plan_apis_batch(ctx, plan: Dict[str, Any]) -> Dict[str, Any]:
                 d = fetch_api_definition_direct(sel_app, sel_api)
                 if d:
                     defn = d.get("definition_text", "")
-                    _log("_validate_plan_apis_batch", step=step,
+                    _log("_validate_apis_and_build_code_plan", step=step,
                          original=f"{hint.get('app')}.{hint.get('api')}",
                          selected=f"{sel_app}.{sel_api}",
                          reason=(sel.get("reason") or "")[:100])
@@ -813,46 +821,9 @@ def _validate_plan_apis_batch(ctx, plan: Dict[str, Any]) -> Dict[str, Any]:
         updated.append(hint)
 
     plan["api_hints"] = updated
-    _log("_validate_plan_apis_batch", steps_evaluated=len(items))
-    return plan
-
-
-def _build_code_plan(ctx, plan: Dict[str, Any]) -> str:
-    """
-    Generate a technical implementation brief from the validated plan.
-
-    This is a prose spec (API sequence, pagination, auth, field names, expected intermediate
-    outputs) that goes directly into generate_solution_code as additional context. It catches
-    gaps between "which API" and "how to call it correctly" before code is written.
-    """
-    hints = _api_hints_context(plan)
-    sys_prompt = (
-        "Write a technical implementation brief for generating AppWorld Python code.\n"
-        "Include:\n"
-        "- Exact API call sequence with method names\n"
-        "- Which APIs need page_index loops and how to detect end-of-pages\n"
-        "- Auth/token requirements (which apps need login, which field: email vs phone_number)\n"
-        "- Data transformations: filters, sorts, aggregations, field names from API docs\n"
-        "- Expected intermediate state after each step\n"
-        "- ANSWER format (type, separator, ordering)\n"
-        "Be specific about field names. This brief goes directly to code generation.\n"
-        'Reply JSON: {"code_plan": "..."}'
-    )
-    user = {
-        "task_instruction": plan.get("instruction"),
-        "task_kind": plan.get("task_kind"),
-        "execution_steps": [q.get("question") for q in plan.get("questions", [])],
-        "api_hints": hints[:8],
-    }
-    out = _model_text(
-        ctx,
-        [{"role": "system", "content": sys_prompt},
-         {"role": "user", "content": json.dumps(user, ensure_ascii=False)}],
-        json_mode=True,
-    )
-    code_plan = _parse_json(out).get("code_plan", "")
-    _log("_build_code_plan", length=len(code_plan), preview=code_plan[:200])
-    return code_plan
+    code_plan = parsed.get("code_plan", "")
+    _log("_validate_apis_and_build_code_plan", steps_evaluated=len(items), code_plan_len=len(code_plan))
+    return plan, code_plan
 
 
 def _api_hints_context(plan: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -1053,54 +1024,7 @@ def verify_solution(
     }
 
 
-def analyse_code_error(
-    ctx,
-    plan: Dict[str, Any],
-    failed_code: str,
-    error: str,
-) -> str:
-    """
-    Given a plan and the code that failed to satisfy it, return a 2-3 sentence
-    diagnosis of the logic failure.
-
-    Deliberately short: this goes straight into the next code-generation prompt as
-    targeted feedback. Long explanations dilute the signal — the model needs to know
-    WHAT was wrong and WHY, not a restatement of the traceback.
-    """
-    sys_prompt = (
-        "You are a concise AppWorld code debugger.\n"
-        "Given a task plan and code that failed, identify the logic failure in 2-3 sentences.\n"
-        "Focus on: wrong API name, missing field, wrong pagination logic, missing login step, "
-        "wrong filter/sort, or incorrect answer format.\n"
-        "Do NOT restate the traceback. State the root cause and the specific fix needed.\n"
-        'Reply JSON: {"analysis": "<2-3 sentences max>"}'
-    )
-    user = {
-        "task_instruction": plan.get("instruction"),
-        "plan_steps": [
-            {"step": q.get("step"), "question": q.get("question")}
-            for q in plan.get("questions", [])
-        ],
-        "api_hints": [
-            f"{h.get('app')}.{h.get('api')}" for h in plan.get("api_hints", []) if h.get("app")
-        ],
-        "failed_code": _feedback_str(failed_code, max_len=1200),
-        "error": _feedback_str(error, max_len=600),
-    }
-    out = _model_text(
-        ctx,
-        [
-            {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
-        ],
-        json_mode=True,
-    )
-    analysis = _parse_json(out).get("analysis", "")
-    _log("analyse_code_error", analysis=analysis[:300])
-    return analysis
-
-
-def _reflect_and_revise(
+def _diagnose_and_revise(
     ctx,
     plan: Dict[str, Any],
     failed_code: str,
@@ -1108,24 +1032,27 @@ def _reflect_and_revise(
     run_result: Dict[str, Any],
 ) -> Tuple[Dict[str, Any], str, bool]:
     """
-    Reflect on a failed attempt: analyze plan + executed code + error to decide
-    whether the plan itself needs changing or only the code does.
+    Single LLM call that diagnoses a failure AND decides whether to revise the plan.
 
+    Replaces two sequential calls (analyse_code_error + _reflect_and_revise).
     Returns (revised_plan, diagnosis, plan_was_changed).
     """
     sys = (
-        "You are reflecting on a failed AppWorld agent attempt.\n"
-        "Analyze the task plan, the code that ran, and the error/feedback.\n"
-        "Determine: is this a CODE error (wrong API name, missing token, bad params, "
-        "wrong field key) or a PLAN error (wrong approach, missing step, wrong app)?\n"
+        "You are debugging a failed AppWorld agent attempt.\n"
+        "Two tasks in one response:\n"
         "\n"
-        "- CODE error → return plan_changed=false and a concise diagnosis of the exact fix.\n"
-        "- PLAN error → return plan_changed=true and a revised questions list.\n"
+        "TASK 1 — Diagnosis: identify the root cause in 2-3 sentences.\n"
+        "Focus on: wrong API name, missing field, wrong pagination logic, missing login step, "
+        "wrong filter/sort, incorrect answer format. State the exact fix needed.\n"
         "\n"
+        "TASK 2 — Plan revision: is this a CODE error or a PLAN error?\n"
+        "- CODE error (wrong API name, bad params, field key) → plan_changed=false, questions=[].\n"
+        "- PLAN error (wrong approach, missing step, wrong app) → plan_changed=true, revised questions list.\n"
         "Only change the plan when truly necessary. Prefer the minimal fix.\n"
+        "\n"
         "Reply JSON only:\n"
         "{\n"
-        '  "diagnosis": "precise description of what failed and how to fix it",\n'
+        '  "diagnosis": "2-3 sentences: root cause and exact fix",\n'
         '  "plan_changed": false,\n'
         '  "questions": []  // only populated when plan_changed=true\n'
         "}"
@@ -1153,7 +1080,7 @@ def _reflect_and_revise(
     parsed = _parse_json(out)
     diagnosis = parsed.get("diagnosis", "")
     plan_changed = bool(parsed.get("plan_changed"))
-    _log("_reflect_and_revise", plan_changed=plan_changed, diagnosis=diagnosis[:300])
+    _log("_diagnose_and_revise", plan_changed=plan_changed, diagnosis=diagnosis[:300])
 
     if plan_changed:
         new_questions = parsed.get("questions") or []
@@ -1174,7 +1101,6 @@ def _reflect_and_revise(
             if normalized:
                 plan = dict(plan)
                 plan["questions"] = normalized[:MAX_PLAN_QUESTIONS]
-                # RAG-enrich only the new steps (reuse hints for unchanged steps)
                 plan = _enrich_new_questions(plan)
                 print_plan(plan, title="REVISED PLAN")
             else:
@@ -1240,16 +1166,10 @@ def check_loop(
             f"{'exec failed' if not run_result.get('ok') else 'answer invalid'}: {fb[:120]}"
         )
 
-        # --- Analyse the failure: 2-3 sentence root-cause diagnosis ---
-        error_analysis = analyse_code_error(ctx, plan, solution.get("code", ""), feedback)
-
-        # --- Reflect: diagnose plan vs code error, possibly revise plan ---
-        plan, diagnosis, plan_changed = _reflect_and_revise(
+        # Single call: diagnose root cause + decide whether to revise the plan
+        plan, diagnosis, plan_changed = _diagnose_and_revise(
             ctx, plan, solution.get("code", ""), feedback, run_result
         )
-        # Prefer the structured analysis over the raw reflect diagnosis when available
-        if error_analysis:
-            diagnosis = error_analysis if not diagnosis else f"{error_analysis}\n{diagnosis}"
 
         # --- Fetch API docs only when needed ---
         if not run_result.get("ok"):
@@ -1618,11 +1538,8 @@ def build_plan(
     _log("build_plan", question_count=len(normalized))
     plan = enrich_plan_with_rag(plan)
 
-    # Validate API candidates: one LLM call picks best API per step from top-3 RAG results
-    plan = _validate_plan_apis_batch(ctx, plan)
-
-    # Technical brief: spec for code generation (API sequence, pagination, fields, ANSWER format)
-    code_plan = _build_code_plan(ctx, plan)
+    # Single LLM call: pick best API per step + produce code plan (replaces two sequential calls)
+    plan, code_plan = _validate_apis_and_build_code_plan(ctx, plan)
     plan["code_plan"] = code_plan
 
     print_plan(plan, title="PLAN (with validated APIs)")
@@ -2001,14 +1918,17 @@ def solve(ctx):
     task_key = re.sub(r"\s+", " ", instruction.lower())[:100]
     _log("solve", session_id=session_id, task_key=task_key)
 
-    # Rich classification: kind + objective + expected_output + constraints
-    classification = task_classification(ctx)
+    # Parallelize task + domain classification (both read only ctx.instruction)
+    with ThreadPoolExecutor(max_workers=2) as _pool:
+        _cls_fut = _pool.submit(task_classification, ctx)
+        _dom_fut = _pool.submit(domain_classification, ctx)
+        classification = _cls_fut.result()
+        apps = _dom_fut.result()
+
     task_kind = classification["kind"]
     task_objective = classification.get("objective", instruction[:200])
     task_constraints = classification.get("constraints") or []
 
-    # Domain classification for initial token bootstrap (keyword/model heuristic)
-    apps = domain_classification(ctx)
     access_tokens = bootstrap_access_tokens(ctx, apps)
 
     # --- Memory: load skills and wins before planning ---
@@ -2095,42 +2015,8 @@ def solve(ctx):
         )
 
         if eval_result.get("pass"):
-            # For question tasks: run an independent code-level re-verification.
-            # This is the graded-run equivalent of the local oracle gate — it re-queries
-            # the live AppWorld APIs to cross-check the answer without needing world.evaluate().
-            if task_kind == "question" and run_result.get("ok") and run_result.get("answer"):
-                verify_result = verify_with_code(ctx, plan, run_result)
-                skill_lib.log_execution(
-                    session_id=session_id,
-                    task_key=task_key,
-                    replan_iter=replan_iter,
-                    attempt=0,
-                    phase="verify_code",
-                    code_fp=solution.get("fp", ""),
-                    exec_ok=bool(run_result.get("ok")),
-                    answer=run_result.get("answer", ""),
-                    eval_pass=verify_result.get("pass"),
-                    eval_critique=verify_result.get("reason", ""),
-                )
-                if not verify_result.get("pass") and replan_iter <= MAX_REPLAN_ITERATIONS:
-                    # Verifier found a mismatch — replan with the discrepancy as critique
-                    eval_result = {
-                        "pass": False,
-                        "critique": verify_result.get("reason", ""),
-                        "missing_steps": [],
-                    }
-                    _log("solve", replan_iter=replan_iter, verify_with_code="FAIL",
-                         reason=eval_result["critique"][:200])
-                else:
-                    if not verify_result.get("pass"):
-                        _log("solve", note="verifier failed but replan budget exhausted — submitting")
-                    else:
-                        _log("solve", replan_iter=replan_iter, verify_with_code="PASS")
-                    _log("solve", replan_iter=replan_iter, evaluation="PASS")
-                    break
-            else:
-                _log("solve", replan_iter=replan_iter, evaluation="PASS")
-                break
+            _log("solve", replan_iter=replan_iter, evaluation="PASS")
+            break
 
         eval_critique = eval_result.get("critique", "")
         eval_missing_steps = eval_result.get("missing_steps") or []
