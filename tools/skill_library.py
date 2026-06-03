@@ -47,10 +47,31 @@ CREATE TABLE IF NOT EXISTS task_log (
     created_at   TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS execution_logs (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id    TEXT NOT NULL,
+    task_key      TEXT NOT NULL,
+    replan_iter   INTEGER NOT NULL DEFAULT 1,
+    attempt       INTEGER NOT NULL DEFAULT 1,
+    phase         TEXT NOT NULL DEFAULT 'exec_verify',
+    code_fp       TEXT NOT NULL DEFAULT '',
+    stdout        TEXT NOT NULL DEFAULT '',
+    error         TEXT NOT NULL DEFAULT '',
+    answer        TEXT NOT NULL DEFAULT '',
+    exec_ok       INTEGER NOT NULL DEFAULT 0,
+    verify_pass   INTEGER NOT NULL DEFAULT 0,
+    verify_reason TEXT NOT NULL DEFAULT '',
+    eval_pass     INTEGER,
+    eval_critique TEXT,
+    created_at    TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_skills_apps     ON skills(apps);
 CREATE INDEX IF NOT EXISTS idx_task_log_apps   ON task_log(apps);
 CREATE INDEX IF NOT EXISTS idx_task_log_kind   ON task_log(task_kind);
 CREATE INDEX IF NOT EXISTS idx_task_log_succ   ON task_log(success);
+CREATE INDEX IF NOT EXISTS idx_exec_logs_sess  ON execution_logs(session_id);
+CREATE INDEX IF NOT EXISTS idx_exec_logs_task  ON execution_logs(task_key);
 """
 
 _DEFAULT_SKILLS: List[Dict[str, Any]] = [
@@ -239,6 +260,57 @@ class SkillLibrary:
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (task_key, json.dumps(apps), task_kind, json.dumps(api_sequence),
              answer or "", int(success), _now()),
+        )
+        self._conn.commit()
+
+    def log_execution(
+        self,
+        session_id: str,
+        task_key: str,
+        replan_iter: int,
+        attempt: int,
+        phase: str,
+        code_fp: str = "",
+        stdout: str = "",
+        error: str = "",
+        answer: str = "",
+        exec_ok: bool = False,
+        verify_pass: bool = False,
+        verify_reason: str = "",
+        eval_pass: Optional[bool] = None,
+        eval_critique: Optional[str] = None,
+    ) -> None:
+        """Persist one execution attempt with its verify/evaluate result.
+
+        phase='exec_verify' → logged per check_loop attempt (attempt 1..N).
+        phase='evaluate'    → logged once per replan iteration after evaluate_solution
+                              (attempt=0, exec_ok/eval_pass/eval_critique populated).
+        stdout and error are truncated to their last 4000/2000 chars to keep the DB lean
+        while preserving the most useful tail (tracebacks, API responses, ANSWER= lines).
+        """
+        self._conn.execute(
+            "INSERT INTO execution_logs "
+            "(session_id, task_key, replan_iter, attempt, phase, code_fp, "
+            "stdout, error, answer, exec_ok, verify_pass, verify_reason, "
+            "eval_pass, eval_critique, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                session_id,
+                task_key,
+                replan_iter,
+                attempt,
+                phase,
+                code_fp or "",
+                (stdout or "")[-4000:],
+                (error or "")[-2000:],
+                answer or "",
+                int(exec_ok),
+                int(verify_pass),
+                verify_reason or "",
+                int(eval_pass) if eval_pass is not None else None,
+                eval_critique,
+                _now(),
+            ),
         )
         self._conn.commit()
 
