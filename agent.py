@@ -1133,8 +1133,11 @@ def build_plan(
         "Use kind=question for read/probe steps, kind=action for a single mutation step.\n"
         "Do NOT include a final formatting step — synthesis happens after all probes.\n"
         "Keep the plan short (3-8 items). Be specific about apps and data needed.\n"
-        "Use memory_skills and similar_tasks if provided — reuse proven API sequences "
-        "instead of rediscovering what already worked.\n"
+        "Use memory from prior tasks if provided:\n"
+        "- proven_plans: exact question sequences that solved similar tasks before — copy the structure if it fits.\n"
+        "- memory_skills: working code patterns with API names — use their api_sequence_hint to order your steps.\n"
+        "- similar_tasks: recent successful api_sequences for the same apps — adapt directly.\n"
+        "Reuse what already worked. Do not rediscover.\n"
         "Reply JSON only:\n"
         "{\n"
         '  "questions": [\n'
