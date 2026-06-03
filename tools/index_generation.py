@@ -8,7 +8,7 @@ Writes under embeddings/ (commit this folder before push):
   index_meta.json   human-readable summary (doc count, paths)
 
 Search (cosine similarity) lives in tools/rag.py:
-  from tools.rag import cosine_similarity_search, make_retriever
+  from tools.rag import cosine_similarity_search
   hits = cosine_similarity_search("spotify song library pagination", top_k=8)
 """
 
@@ -20,7 +20,7 @@ import os
 import pickle
 import sys
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import List, Optional
 
 INDEX_VERSION = 1
 DEFAULT_APIS_DIR = "api_docs_dump/apis"
@@ -139,19 +139,6 @@ def _cli_search(query: str, top_k: int) -> None:
 
     out = cosine_similarity_search(query, top_k=top_k)
     print(json.dumps(out, indent=2, ensure_ascii=False))
-
-
-# Backward-compatible re-exports
-def retrieve(query: str, top_k: int = 10) -> Dict[str, Any]:
-    from tools.rag import retrieve as rag_retrieve
-
-    return rag_retrieve(query, top_k=top_k)
-
-
-def make_retriever(top_k: int = 10) -> Callable[[str], Dict[str, Any]]:
-    from tools.rag import make_retriever as rag_make_retriever
-
-    return rag_make_retriever(top_k=top_k)
 
 
 def main() -> None:
