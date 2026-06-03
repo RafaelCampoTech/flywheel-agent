@@ -1397,9 +1397,33 @@ def _submit(ctx, task_kind: str, answer: str) -> None:
     _log("submit", status="done")
 
 
+def _bootstrap_memory_dir(memory_dir: str) -> None:
+    """Copy pre-trained artifacts from the repo's memory/ bundle into memory_dir if missing.
+
+    On the graded run FLYWHEEL_MEMORY_DIR starts empty. This seeds it from the committed
+    memory/skills.db and memory/memory.json so every task benefits from local training
+    without needing to re-learn from scratch.
+    """
+    import shutil as _shutil
+    repo_memory = Path(__file__).resolve().parent / "memory"
+    if not repo_memory.is_dir():
+        return
+    target_dir = Path(memory_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    for fname in ("skills.db", "memory.json"):
+        source = repo_memory / fname
+        target = target_dir / fname
+        if source.exists() and not target.exists():
+            _shutil.copy2(str(source), str(target))
+            _log("bootstrap_memory", copied=fname)
+
+
 def solve(ctx):
     instruction = ctx.instruction or ""
     _log("solve", instruction=instruction)
+
+    # Seed FLYWHEEL_MEMORY_DIR from repo bundle on first graded task
+    _bootstrap_memory_dir(ctx.memory.dir)
 
     task_kind = task_classification(ctx)
     apps = domain_classification(ctx)
