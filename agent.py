@@ -881,6 +881,53 @@ def verify_solution(
     }
 
 
+def analyse_code_error(
+    ctx,
+    plan: Dict[str, Any],
+    failed_code: str,
+    error: str,
+) -> str:
+    """
+    Given a plan and the code that failed to satisfy it, return a 2-3 sentence
+    diagnosis of the logic failure.
+
+    Deliberately short: this goes straight into the next code-generation prompt as
+    targeted feedback. Long explanations dilute the signal — the model needs to know
+    WHAT was wrong and WHY, not a restatement of the traceback.
+    """
+    sys_prompt = (
+        "You are a concise AppWorld code debugger.\n"
+        "Given a task plan and code that failed, identify the logic failure in 2-3 sentences.\n"
+        "Focus on: wrong API name, missing field, wrong pagination logic, missing login step, "
+        "wrong filter/sort, or incorrect answer format.\n"
+        "Do NOT restate the traceback. State the root cause and the specific fix needed.\n"
+        'Reply JSON: {"analysis": "<2-3 sentences max>"}'
+    )
+    user = {
+        "task_instruction": plan.get("instruction"),
+        "plan_steps": [
+            {"step": q.get("step"), "question": q.get("question")}
+            for q in plan.get("questions", [])
+        ],
+        "api_hints": [
+            f"{h.get('app')}.{h.get('api')}" for h in plan.get("api_hints", []) if h.get("app")
+        ],
+        "failed_code": _feedback_str(failed_code, max_len=1200),
+        "error": _feedback_str(error, max_len=600),
+    }
+    out = _model_text(
+        ctx,
+        [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
+        ],
+        json_mode=True,
+    )
+    analysis = _parse_json(out).get("analysis", "")
+    _log("analyse_code_error", analysis=analysis[:300])
+    return analysis
+
+
 def _reflect_and_revise(
     ctx,
     plan: Dict[str, Any],
@@ -1003,10 +1050,16 @@ def check_loop(
             f"{'exec failed' if not run_result.get('ok') else 'answer invalid'}: {fb[:120]}"
         )
 
+        # --- Analyse the failure: 2-3 sentence root-cause diagnosis ---
+        error_analysis = analyse_code_error(ctx, plan, solution.get("code", ""), feedback)
+
         # --- Reflect: diagnose plan vs code error, possibly revise plan ---
         plan, diagnosis, plan_changed = _reflect_and_revise(
             ctx, plan, solution.get("code", ""), feedback, run_result
         )
+        # Prefer the structured analysis over the raw reflect diagnosis when available
+        if error_analysis:
+            diagnosis = error_analysis if not diagnosis else f"{error_analysis}\n{diagnosis}"
 
         # --- Fetch API docs only when needed ---
         if not run_result.get("ok"):
@@ -1186,10 +1239,18 @@ def generate_solution_code(
         for h in hints_ctx
         if h.get("paginated") and h.get("suggested_api")
     ]
+    available_tokens = list((plan.get("access_tokens") or {}).keys())
     sys = (
         "Write Python to finish an AppWorld task.\n"
         "Variable `apis` is ALREADY in scope — never write import apis or from apis.\n"
-        "`access_tokens` dict is provided — use access_tokens['spotify'], do not re-login.\n"
+        f"`access_tokens` dict currently has keys: {available_tokens}.\n"
+        "Use access_tokens['app'] for apps that are already listed above.\n"
+        "IMPORTANT — if you need a token for an app NOT in that list, add the login inline:\n"
+        "  me = apis.supervisor.show_profile()\n"
+        "  pw = {p['account_name']: p['password'] for p in apis.supervisor.show_account_passwords()}\n"
+        "  venmo_tok = apis.venmo.login(username=me['email'], password=pw['venmo'])['access_token']\n"
+        "  # phone uses me['phone_number'] instead of me['email']\n"
+        "Never assume a token exists — check the available_tokens list above first.\n"
         "Use api_hints: each plan step has a RAG-suggested API and definition_text — "
         "call those exact api names (e.g. show_song_library, show_song).\n"
         "\n"
@@ -1259,7 +1320,7 @@ def generate_solution_code(
         "api_hints": hints_ctx,
         "paginated_apis": paginated_apis,
         "probes": plan.get("probes", []),
-        "access_tokens": list((plan.get("access_tokens") or {}).keys()),
+        "access_tokens_available": available_tokens,
     }
     out = _model_text(
         ctx,
@@ -1443,7 +1504,7 @@ def solve(ctx):
         if any(a in v.get("apps", []) for a in apps)
     ][:3]
 
-    # All memory sources flow into planning AND code generation
+    # Pass 1: instruction-level search feeds planning context
     plan = build_plan(
         ctx, task_kind, apps,
         access_tokens=access_tokens,
@@ -1451,8 +1512,17 @@ def solve(ctx):
         relevant_skills=relevant_skills,
         similar_tasks=similar_tasks,
     )
-    # Also attach to plan so generate_solution_code can inject full skill code
-    plan["relevant_skills"] = relevant_skills
+
+    # Pass 2: search again using the plan's specific questions as queries.
+    # Plan questions ("list all spotify songs with pagination", "get play_count per song_id")
+    # are far more precise queries than the raw instruction and match skill descriptions
+    # and API method names (show_song_library, page_index …) much more directly.
+    plan_queries = [q.get("question", "") for q in plan.get("questions", []) if q.get("question")]
+    code_gen_skills = skill_lib.search_multi(
+        [instruction] + plan_queries, apps, top_k=6
+    )
+    _log("solve", code_gen_skills=len(code_gen_skills))
+    plan["relevant_skills"] = code_gen_skills
 
     run_result, solution = check_loop(ctx, plan)
     if _local_env(ctx) is not None:
