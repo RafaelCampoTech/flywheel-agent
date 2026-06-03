@@ -15,20 +15,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from tools.skill_library import SkillLibrary, skill_name_for
 
-# --- defaults stored in memory on first run ---
-DEFAULT_SKILLS: List[Dict[str, Any]] = [
-    {
-        "name": "supervisor_login_bootstrap",
-        "app": "supervisor",
-        "recipe": ["show_profile", "show_account_passwords"],
-    },
-    {
-        "name": "spotify_login",
-        "app": "spotify",
-        "recipe": ["show_profile", "show_account_passwords", "login"],
-    },
-]
-
 APPS = [
     "spotify", "amazon", "gmail", "phone", "venmo", "splitwise",
     "todoist", "simple_note", "file_system", "supervisor", "api_docs",
@@ -509,25 +495,6 @@ def retrieve_relevant_docs(
 
 
 
-def retrieve_skills(ctx, apps: List[str]) -> List[Dict[str, Any]]:
-    """Load skills from memory; seed defaults if empty."""
-    _log("retrieve_skills", apps=apps)
-    mem = ctx.memory.read() or {}
-    skills = mem.get("skills")
-    if not isinstance(skills, list) or not skills:
-        skills = list(DEFAULT_SKILLS)
-        ctx.memory.write("skills", skills)
-    # filter to relevant apps (+ always include supervisor bootstrap)
-    relevant = []
-    for s in skills:
-        if not isinstance(s, dict):
-            continue
-        app = s.get("app", "")
-        if app in apps or app == "supervisor":
-            relevant.append(s)
-    result = relevant or list(DEFAULT_SKILLS)
-    _log("retrieve_skills", skills=[s.get("name") for s in result if isinstance(s, dict)])
-    return result
 
 
 
@@ -1097,10 +1064,10 @@ def build_plan(
     ctx,
     task_kind: str,
     apps: List[str],
-    skills: List[Dict[str, Any]],
     access_tokens: Optional[Dict[str, str]] = None,
     prior_plans: Optional[List[Dict[str, Any]]] = None,
     relevant_skills: Optional[List[Dict[str, Any]]] = None,
+    similar_tasks: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Build an ordered list of sub-questions/actions to probe via question_to_api."""
     _log("build_plan", task_kind=task_kind, apps=apps)
@@ -1113,8 +1080,8 @@ def build_plan(
         "Use kind=question for read/probe steps, kind=action for a single mutation step.\n"
         "Do NOT include a final formatting step — synthesis happens after all probes.\n"
         "Keep the plan short (3-8 items). Be specific about apps and data needed.\n"
-        "If memory_skills or proven_plans are provided, reuse their API call sequence "
-        "as a starting point — avoid rediscovering what already worked.\n"
+        "Use memory_skills and similar_tasks if provided — reuse proven API sequences "
+        "instead of rediscovering what already worked.\n"
         "Reply JSON only:\n"
         "{\n"
         '  "questions": [\n'
@@ -1127,7 +1094,6 @@ def build_plan(
         "task_instruction": ctx.instruction,
         "task_kind": task_kind,
         "apps": apps,
-        "skills": skills,
         "access_tokens_available": list((access_tokens or {}).keys()),
         "proven_plans": prior_plans or [],
     }
@@ -1140,6 +1106,15 @@ def build_plan(
                 "success_count": s.get("success_count", 1),
             }
             for s in relevant_skills
+        ]
+    if similar_tasks:
+        user["similar_tasks"] = [
+            {
+                "apps": t.get("apps"),
+                "api_sequence": t.get("api_sequence"),
+                "answer_preview": t.get("answer_preview"),
+            }
+            for t in similar_tasks
         ]
     out = _model_text(
         ctx,
@@ -1176,7 +1151,6 @@ def build_plan(
     plan = {
         "task_kind": task_kind,
         "apps": apps,
-        "skills": skills,
         "access_tokens": access_tokens or {},
         "instruction": ctx.instruction,
         "questions": normalized[:MAX_PLAN_QUESTIONS],
@@ -1334,6 +1308,82 @@ def execute_code(ctx, code: str, attempt: int = 1) -> Dict[str, Any]:
     return result
 
 
+def learn_from_oracle_feedback(
+    ctx,
+    skill_lib: Any,
+    instruction: str,
+    apps: List[str],
+    task_kind: str,
+    failed_code: str,
+    oracle_verdict: Dict[str, Any],
+    answer: str,
+) -> Optional[str]:
+    """
+    Local-only: given oracle failures, ask the model to generate a corrected skill and save it.
+    Returns the skill name saved, or None if nothing was generated.
+
+    The oracle verdict contains exactly what assertion broke and what the world state
+    actually was vs. what was expected — richer signal than a traceback.
+    """
+    failures = oracle_verdict.get("failures") or []
+    if not failures:
+        return None
+
+    failure_text = _oracle_failure_text(oracle_verdict)
+    _log("learn_from_oracle_feedback", failure_preview=failure_text[:300])
+
+    sys_prompt = (
+        "You are learning from an AppWorld oracle failure to write a corrected skill.\n"
+        "The oracle compared the world state AFTER your code ran vs. the expected state.\n"
+        "It tells you exactly what assertion failed: what you produced (left) vs. what was expected (right).\n"
+        "\n"
+        "Your job: write CORRECTED Python code that would produce the expected world state.\n"
+        "\n"
+        "Rules:\n"
+        "- `apis` and `access_tokens` are already in scope — never import apis, never hardcode token values.\n"
+        "- Paginate all list APIs (page_index loop).\n"
+        "- Do NOT call complete_task() or supervisor.complete_task().\n"
+        "- Be specific: if oracle says a download was missing, add the download call.\n"
+        "  If oracle says a record was wrong, fix the exact field.\n"
+        "\n"
+        'Reply JSON: {"corrected_code": "...", "lesson": "<one-line: what was missing or wrong>"}'
+    )
+    user = {
+        "task_instruction": instruction,
+        "apps": apps,
+        "task_kind": task_kind,
+        "submitted_answer": answer,
+        "failed_code": _feedback_str(failed_code, max_len=1500),
+        "oracle_failures": failure_text[:1000],
+    }
+    out = _model_text(
+        ctx,
+        [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
+        ],
+        json_mode=True,
+    )
+    parsed = _parse_json(out)
+    corrected = _sanitize_appworld_code(_strip_token_preamble(parsed.get("corrected_code", "")))
+    lesson = (parsed.get("lesson") or "")[:200]
+
+    if not corrected:
+        _log("learn_from_oracle_feedback", result="no_code_generated")
+        return None
+
+    sname = skill_name_for(instruction, apps)
+    skill_lib.add_skill(
+        name=sname,
+        apps=apps,
+        description=f"[oracle-corrected] {lesson or instruction[:150]}",
+        code=corrected[:1500],
+        tags=[task_kind, "oracle-corrected"] + apps,
+    )
+    _log("learn_from_oracle_feedback", skill_saved=sname, lesson=lesson)
+    return sname
+
+
 def _submit(ctx, task_kind: str, answer: str) -> None:
     _log("submit", task_kind=task_kind, answer=answer)
     env = _local_env(ctx)
@@ -1354,15 +1404,14 @@ def solve(ctx):
     task_kind = task_classification(ctx)
     apps = domain_classification(ctx)
     access_tokens = bootstrap_access_tokens(ctx, apps)
-    skills = retrieve_skills(ctx, apps)
 
-    # --- GBrain: open persistent skill library ---
+    # --- GBrain: load all memory before planning ---
     skill_lib = SkillLibrary(ctx.memory.dir)
     relevant_skills = skill_lib.search(instruction, apps, top_k=4)
     similar_tasks = skill_lib.similar_tasks(apps, task_kind, top_k=3)
     _log("solve", skills_retrieved=len(relevant_skills), similar_tasks=len(similar_tasks))
 
-    # Pull prior plan structures from the JSON wins index
+    # JSON wins index: lightweight plan structure cache (questions + api_sequence per task)
     mem = ctx.memory.read() or {}
     wins = mem.get("wins", {}) if isinstance(mem, dict) else {}
     prior_plans = [
@@ -1370,15 +1419,16 @@ def solve(ctx):
         if any(a in v.get("apps", []) for a in apps)
     ][:3]
 
+    # All memory sources flow into planning AND code generation
     plan = build_plan(
-        ctx, task_kind, apps, skills,
+        ctx, task_kind, apps,
         access_tokens=access_tokens,
         prior_plans=prior_plans,
         relevant_skills=relevant_skills,
+        similar_tasks=similar_tasks,
     )
-    # Attach skills so generate_solution_code also injects them into the code-gen prompt
+    # Also attach to plan so generate_solution_code can inject full skill code
     plan["relevant_skills"] = relevant_skills
-    plan["similar_tasks"] = similar_tasks
 
     run_result, solution = check_loop(ctx, plan)
     if _local_env(ctx) is not None:
@@ -1431,6 +1481,27 @@ def solve(ctx):
     else:
         # Log failures too — useful for pattern analysis
         skill_lib.log_task(key, apps, task_kind, api_sequence, answer, success=False)
+
+    # Local-only: use oracle verdict to learn from failures and generate corrected skills
+    env = _local_env(ctx)
+    if env is not None:
+        try:
+            oracle_verdict = env.world.evaluate().to_dict()
+            if not oracle_verdict.get("success"):
+                clean_code = _strip_token_preamble(solution.get("code", ""))
+                learned = learn_from_oracle_feedback(
+                    ctx, skill_lib,
+                    instruction=instruction,
+                    apps=apps,
+                    task_kind=task_kind,
+                    failed_code=clean_code,
+                    oracle_verdict=oracle_verdict,
+                    answer=answer,
+                )
+                if learned:
+                    _log("solve", oracle_skill_learned=learned)
+        except Exception as exc:
+            _log("solve", oracle_learn_error=str(exc)[:150])
 
     skill_lib.close()
     _log("solve", status="finished")
