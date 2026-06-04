@@ -1476,106 +1476,6 @@ def check_loop(
     return run_result, solution
 
 
-def generate_verification_code(
-    ctx,
-    plan: Dict[str, Any],
-    answer: str,
-) -> Dict[str, Any]:
-    """
-    Generate a short independent snippet that re-queries AppWorld to cross-check the answer.
-
-    Unlike the main solution code, this verifier starts from scratch: it re-runs the minimal
-    API calls needed to reproduce or confirm the answer, then prints exactly one of:
-        VERIFY_OK
-        VERIFY_FAIL: recomputed=<value> submitted=<answer>
-
-    Failing to execute (traceback) is treated as inconclusive, not as FAIL, so a buggy
-    verifier never blocks a correct answer.
-    """
-    sys_prompt = (
-        "Write a SHORT Python verification snippet for an AppWorld task answer.\n"
-        "The main code already ran and produced an answer. Your job: independently re-query "
-        "the APIs to confirm or refute it.\n"
-        "\n"
-        "Rules:\n"
-        "- `apis` and `access_tokens` are already in scope.\n"
-        "- Start from scratch — do not assume any variables from the main code exist.\n"
-        "- Re-query the key APIs and recompute the value the answer claims.\n"
-        "- Print exactly one line:\n"
-        "    VERIFY_OK                              (answer confirmed)\n"
-        "    VERIFY_FAIL: recomputed=X submitted=Y  (mismatch found)\n"
-        "- Keep it under 30 lines. Target the SINGLE decisive assertion.\n"
-        "- For count tasks: recount, compare to submitted number.\n"
-        "- For ranked list tasks: recompute top-N, compare order and items.\n"
-        "- For lookup tasks: re-fetch the record, compare the field.\n"
-        "- Do NOT call complete_task. Do NOT repeat the full main code.\n"
-        'Reply JSON: {"code": "..."}'
-    )
-    available_tokens = list((plan.get("access_tokens") or {}).keys())
-    user = {
-        "task_instruction": plan.get("instruction"),
-        "task_kind": plan.get("task_kind"),
-        "submitted_answer": answer,
-        "api_hints": [
-            f"{h.get('app')}.{h.get('api')}"
-            for h in plan.get("api_hints", []) if h.get("app")
-        ],
-        "access_tokens_available": available_tokens,
-    }
-    out = _model_text(
-        ctx,
-        [{"role": "system", "content": sys_prompt},
-         {"role": "user", "content": json.dumps(user, ensure_ascii=False)}],
-        json_mode=True,
-    )
-    code = _sanitize_appworld_code(_parse_json(out).get("code", ""))
-    if not code:
-        return {"code": ""}
-    tokens_literal = json.dumps(plan.get("access_tokens") or {})
-    full_code = f"access_tokens = {tokens_literal}\n{code}"
-    _log("generate_verification_code", code_len=len(full_code))
-    return {"code": full_code}
-
-
-def verify_with_code(
-    ctx,
-    plan: Dict[str, Any],
-    run_result: Dict[str, Any],
-) -> Dict[str, Any]:
-    """
-    Run an independent verification snippet against the live AppWorld state.
-
-    Returns {"pass": bool, "reason": str}.
-    A traceback in the verifier is treated as inconclusive (pass=True) so a broken
-    verifier never blocks submission of a correct answer. Only an explicit VERIFY_FAIL
-    line in stdout is treated as a real failure.
-    """
-    answer = run_result.get("answer", "")
-    if not answer:
-        return {"pass": True, "reason": "no answer to verify"}
-
-    verification = generate_verification_code(ctx, plan, answer)
-    code = verification.get("code", "")
-    if not code:
-        return {"pass": True, "reason": "no verification code generated"}
-
-    result = execute_code(ctx, code, attempt=99)  # attempt=99 marks verifier calls in logs
-
-    if not result.get("ok"):
-        # Verifier itself crashed — treat as inconclusive, not as FAIL
-        _log("verify_with_code", status="inconclusive", error=result.get("error", "")[:200])
-        return {"pass": True, "reason": "verifier execution error — inconclusive"}
-
-    stdout = result.get("stdout", "")
-    if "VERIFY_FAIL" in stdout:
-        reason = next(
-            (l for l in reversed(stdout.splitlines()) if "VERIFY_FAIL" in l), stdout[-300:]
-        )
-        _log("verify_with_code", status="FAIL", reason=reason[:200])
-        return {"pass": False, "reason": reason.strip()}
-
-    _log("verify_with_code", status="PASS")
-    return {"pass": True, "reason": "independent code verification passed"}
 
 
 def evaluate_solution(
@@ -2558,42 +2458,8 @@ def solve(ctx):
             )
 
             if eval_result.get("pass"):
-                # For question tasks: run an independent code-level re-verification.
-                # This is the graded-run equivalent of the local oracle gate — it re-queries
-                # the live AppWorld APIs to cross-check the answer without needing world.evaluate().
-                if task_kind == "question" and run_result.get("ok") and run_result.get("answer"):
-                    verify_result = verify_with_code(ctx, plan, run_result)
-                    skill_lib.log_execution(
-                        session_id=session_id,
-                        task_key=task_key,
-                        replan_iter=replan_iter,
-                        attempt=0,
-                        phase="verify_code",
-                        code_fp=solution.get("fp", ""),
-                        exec_ok=bool(run_result.get("ok")),
-                        answer=run_result.get("answer", ""),
-                        eval_pass=verify_result.get("pass"),
-                        eval_critique=verify_result.get("reason", ""),
-                    )
-                    if not verify_result.get("pass") and replan_iter <= MAX_REPLAN_ITERATIONS:
-                        # Verifier found a mismatch — replan with the discrepancy as critique
-                        eval_result = {
-                            "pass": False,
-                            "critique": verify_result.get("reason", ""),
-                            "missing_steps": [],
-                        }
-                        _log("solve", replan_iter=replan_iter, verify_with_code="FAIL",
-                             reason=eval_result["critique"][:200])
-                    else:
-                        if not verify_result.get("pass"):
-                            _log("solve", note="verifier failed but replan budget exhausted — submitting")
-                        else:
-                            _log("solve", replan_iter=replan_iter, verify_with_code="PASS")
-                        _log("solve", replan_iter=replan_iter, evaluation="PASS")
-                        break
-                else:
-                    _log("solve", replan_iter=replan_iter, evaluation="PASS")
-                    break
+                _log("solve", replan_iter=replan_iter, evaluation="PASS")
+                break
 
             eval_critique = eval_result.get("critique", "")
             eval_missing_steps = eval_result.get("missing_steps") or []
