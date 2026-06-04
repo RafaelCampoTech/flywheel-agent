@@ -11,12 +11,14 @@ import hashlib
 import json
 import os
 import re
+import signal
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from tools.skill_library import SkillLibrary, skill_name_for
+from tools.wins_store import WinsStore
 
 APPS = [
     "spotify", "amazon", "gmail", "phone", "venmo", "splitwise",
@@ -36,8 +38,8 @@ AUTH_APPS = {
 SKIP_LOGIN = {"supervisor", "api_docs"}
 MAX_PLAN_QUESTIONS = 10
 _MAX_RAG_WORKERS = 8
-_CHECK_LOOP_ATTEMPTS = 4
-MAX_REPLAN_ITERATIONS = 1  # max extra replan cycles after the first attempt
+_CHECK_LOOP_ATTEMPTS = 3   # max attempts to fix a failing execution inside one plan cycle
+MAX_REPLAN_ITERATIONS = 3  # max full replan cycles after oracle/evaluator rejects the answer
 _rag_cache: Any = None
 
 
@@ -1941,9 +1943,8 @@ def _submit(ctx, task_kind: str, answer: str) -> None:
 def _bootstrap_memory_dir(memory_dir: str) -> None:
     """Copy pre-trained artifacts from the repo's memory/ bundle into memory_dir if missing.
 
-    On the graded run FLYWHEEL_MEMORY_DIR starts empty. This seeds it from the committed
-    memory/skills.db and memory/memory.json so every task benefits from local training
-    without needing to re-learn from scratch.
+    On the graded run FLYWHEEL_MEMORY_DIR starts empty. This seeds it from committed
+    memory/skills.db and memory/wins_chroma/ so every task benefits from prior training.
     """
     import shutil as _shutil
     repo_memory = Path(__file__).resolve().parent / "memory"
@@ -1951,12 +1952,32 @@ def _bootstrap_memory_dir(memory_dir: str) -> None:
         return
     target_dir = Path(memory_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
-    for fname in ("skills.db", "memory.json"):
+
+    # Single-file artifacts
+    for fname in ("skills.db",):
         source = repo_memory / fname
         target = target_dir / fname
         if source.exists() and not target.exists():
             _shutil.copy2(str(source), str(target))
             _log("bootstrap_memory", copied=fname)
+
+    # Chroma wins directory
+    wins_src = repo_memory / "wins_chroma"
+    wins_tgt = target_dir / "wins_chroma"
+    if wins_src.is_dir() and not wins_tgt.exists():
+        _shutil.copytree(str(wins_src), str(wins_tgt))
+        _log("bootstrap_memory", copied="wins_chroma")
+
+
+SOLVE_TIMEOUT_SECONDS = 300  # 5 minutes
+
+
+class _AgentTimeout(Exception):
+    """Raised when the per-task solve() deadline fires."""
+
+
+def _timeout_handler(signum, frame):
+    raise _AgentTimeout("agent timed out after 5 minutes")
 
 
 def solve(ctx):
@@ -1971,209 +1992,221 @@ def solve(ctx):
     task_key = re.sub(r"\s+", " ", instruction.lower())[:100]
     _log("solve", session_id=session_id, task_key=task_key)
 
-    # Rich classification: kind + objective + expected_output + constraints
-    classification = task_classification(ctx)
-    task_kind = classification["kind"]
-    task_objective = classification.get("objective", instruction[:200])
-    task_constraints = classification.get("constraints") or []
-
-    # Domain classification for initial token bootstrap (keyword/model heuristic)
-    apps = domain_classification(ctx)
-    access_tokens = bootstrap_access_tokens(ctx, apps)
-
-    # --- Memory: load skills and wins before planning ---
-    skill_lib = SkillLibrary(ctx.memory.dir)
-    relevant_skills = skill_lib.search(instruction, apps, top_k=4)
-    similar_tasks = skill_lib.similar_tasks(apps, task_kind, top_k=3)
-    _log("solve", skills_retrieved=len(relevant_skills), similar_tasks=len(similar_tasks))
-
-    mem = ctx.memory.read() or {}
-    wins = mem.get("wins", {}) if isinstance(mem, dict) else {}
-    prior_plans = [
-        v for v in (wins.values() if isinstance(wins, dict) else [])
-        if any(a in v.get("apps", []) for a in apps)
-    ][:3]
-
-    # --- Replanning loop: plan -> execute -> evaluate -> replan on semantic FAIL ---
-    eval_critique = ""
-    eval_missing_steps: List[str] = []
+    # Pre-initialize so the timeout handler can always call _submit and skill_lib.close()
+    task_kind: str = "question"
+    apps: List[str] = []
+    access_tokens: Dict[str, str] = {}
     run_result: Dict[str, Any] = {"ok": False, "answer": ""}
     solution: Dict[str, Any] = {"code": ""}
     plan: Dict[str, Any] = {}
+    skill_lib: Any = None
+    wins_store: Any = None
+    prior_plans: List[Dict[str, Any]] = []
+    all_apps: List[str] = []
+    api_sequence: List[str] = []
+    timed_out = False
 
-    for replan_iter in range(1, MAX_REPLAN_ITERATIONS + 2):  # 1 initial + MAX_REPLAN_ITERATIONS replans
-        _log("solve", replan_iter=replan_iter, eval_critique_len=len(eval_critique))
+    old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+    signal.alarm(SOLVE_TIMEOUT_SECONDS)
+    try:
+        # Rich classification: kind + objective + expected_output + constraints
+        classification = task_classification(ctx)
+        task_kind = classification["kind"]
+        task_objective = classification.get("objective", instruction[:200])
+        task_constraints = classification.get("constraints") or []
 
-        plan = build_plan(
-            ctx, task_kind, apps,
-            access_tokens=access_tokens,
-            prior_plans=prior_plans,
-            relevant_skills=relevant_skills,
-            similar_tasks=similar_tasks,
-            eval_critique=eval_critique,
-            eval_missing_steps=eval_missing_steps,
-            task_objective=task_objective,
-            task_constraints=task_constraints,
-        )
+        # Domain classification for initial token bootstrap (keyword/model heuristic)
+        apps = domain_classification(ctx)
+        access_tokens = bootstrap_access_tokens(ctx, apps)
 
-        # Supplement tokens for any apps discovered by RAG that weren't in initial bootstrap
-        rag_apps = list({
-            h.get("app") for h in plan.get("api_hints", [])
-            if h.get("app") and h.get("app") in AUTH_APPS
-        })
-        new_apps = [a for a in rag_apps if a not in access_tokens]
-        if new_apps:
-            extra_tokens = bootstrap_access_tokens(ctx, new_apps)
-            access_tokens.update(extra_tokens)
-            plan["access_tokens"] = access_tokens
-            _log("solve", extra_tokens_bootstrapped=new_apps)
+        # --- Memory: load skills and wins before planning ---
+        skill_lib = SkillLibrary(ctx.memory.dir)
+        wins_store = WinsStore(ctx.memory.dir)
+        relevant_skills = skill_lib.search(instruction, apps, top_k=4)
+        similar_tasks = skill_lib.similar_tasks(apps, task_kind, top_k=3)
+        prior_plans = wins_store.search(instruction, apps, top_k=3)
+        _log("solve", skills_retrieved=len(relevant_skills), similar_tasks=len(similar_tasks),
+             prior_plans=len(prior_plans))
 
-        # Pass 2 skill search: plan questions are more precise than the raw instruction
-        plan_queries = [q.get("question", "") for q in plan.get("questions", []) if q.get("question")]
-        all_apps = list(set(apps + rag_apps))
-        code_gen_skills = skill_lib.search_multi([instruction] + plan_queries, all_apps, top_k=6)
-        _log("solve", code_gen_skills=len(code_gen_skills))
-        plan["relevant_skills"] = code_gen_skills
+        # --- Replanning loop: plan -> execute -> evaluate -> replan on semantic FAIL ---
+        eval_critique = ""
+        eval_missing_steps: List[str] = []
 
-        # Tag plan so check_loop can correlate every attempt to this session and iteration
-        plan["session_id"] = session_id
-        plan["task_key"] = task_key
-        plan["replan_iter"] = replan_iter
+        for replan_iter in range(1, MAX_REPLAN_ITERATIONS + 2):  # 1 initial + MAX_REPLAN_ITERATIONS replans
+            _log("solve", replan_iter=replan_iter, eval_critique_len=len(eval_critique))
 
-        run_result, solution = check_loop(ctx, plan, skill_lib=skill_lib)
-        if _local_env(ctx) is not None:
-            run_result, solution = _oracle_gate(ctx, plan, run_result, solution)
+            plan = build_plan(
+                ctx, task_kind, apps,
+                access_tokens=access_tokens,
+                prior_plans=prior_plans,
+                relevant_skills=relevant_skills,
+                similar_tasks=similar_tasks,
+                eval_critique=eval_critique,
+                eval_missing_steps=eval_missing_steps,
+                task_objective=task_objective,
+                task_constraints=task_constraints,
+            )
 
-        # Semantic evaluation: independent check that the objective was actually achieved
-        eval_result = evaluate_solution(
-            ctx, plan, solution.get("code", ""), run_result,
-            code_plan=plan.get("code_plan", ""), attempt=replan_iter,
-        )
+            # Supplement tokens for any apps discovered by RAG that weren't in initial bootstrap
+            rag_apps = list({
+                h.get("app") for h in plan.get("api_hints", [])
+                if h.get("app") and h.get("app") in AUTH_APPS
+            })
+            new_apps = [a for a in rag_apps if a not in access_tokens]
+            if new_apps:
+                extra_tokens = bootstrap_access_tokens(ctx, new_apps)
+                access_tokens.update(extra_tokens)
+                plan["access_tokens"] = access_tokens
+                _log("solve", extra_tokens_bootstrapped=new_apps)
 
-        # Persist the evaluate result alongside the last exec attempt for this iteration
-        skill_lib.log_execution(
-            session_id=session_id,
-            task_key=task_key,
-            replan_iter=replan_iter,
-            attempt=0,
-            phase="evaluate",
-            code_fp=solution.get("fp", ""),
-            exec_ok=bool(run_result.get("ok")),
-            answer=run_result.get("answer", ""),
-            eval_pass=eval_result.get("pass"),
-            eval_critique=eval_result.get("critique", ""),
-        )
+            # Pass 2 skill search: plan questions are more precise than the raw instruction
+            plan_queries = [q.get("question", "") for q in plan.get("questions", []) if q.get("question")]
+            all_apps = list(set(apps + rag_apps))
+            code_gen_skills = skill_lib.search_multi([instruction] + plan_queries, all_apps, top_k=6)
+            _log("solve", code_gen_skills=len(code_gen_skills))
+            plan["relevant_skills"] = code_gen_skills
 
-        if eval_result.get("pass"):
-            # For question tasks: run an independent code-level re-verification.
-            # This is the graded-run equivalent of the local oracle gate — it re-queries
-            # the live AppWorld APIs to cross-check the answer without needing world.evaluate().
-            if task_kind == "question" and run_result.get("ok") and run_result.get("answer"):
-                verify_result = verify_with_code(ctx, plan, run_result)
-                skill_lib.log_execution(
-                    session_id=session_id,
-                    task_key=task_key,
-                    replan_iter=replan_iter,
-                    attempt=0,
-                    phase="verify_code",
-                    code_fp=solution.get("fp", ""),
-                    exec_ok=bool(run_result.get("ok")),
-                    answer=run_result.get("answer", ""),
-                    eval_pass=verify_result.get("pass"),
-                    eval_critique=verify_result.get("reason", ""),
-                )
-                if not verify_result.get("pass") and replan_iter <= MAX_REPLAN_ITERATIONS:
-                    # Verifier found a mismatch — replan with the discrepancy as critique
-                    eval_result = {
-                        "pass": False,
-                        "critique": verify_result.get("reason", ""),
-                        "missing_steps": [],
-                    }
-                    _log("solve", replan_iter=replan_iter, verify_with_code="FAIL",
-                         reason=eval_result["critique"][:200])
-                else:
-                    if not verify_result.get("pass"):
-                        _log("solve", note="verifier failed but replan budget exhausted — submitting")
+            # Tag plan so check_loop can correlate every attempt to this session and iteration
+            plan["session_id"] = session_id
+            plan["task_key"] = task_key
+            plan["replan_iter"] = replan_iter
+
+            run_result, solution = check_loop(ctx, plan, skill_lib=skill_lib)
+            if _local_env(ctx) is not None:
+                run_result, solution = _oracle_gate(ctx, plan, run_result, solution)
+
+            # Semantic evaluation: independent check that the objective was actually achieved
+            eval_result = evaluate_solution(
+                ctx, plan, solution.get("code", ""), run_result,
+                code_plan=plan.get("code_plan", ""), attempt=replan_iter,
+            )
+
+            # Persist the evaluate result alongside the last exec attempt for this iteration
+            skill_lib.log_execution(
+                session_id=session_id,
+                task_key=task_key,
+                replan_iter=replan_iter,
+                attempt=0,
+                phase="evaluate",
+                code_fp=solution.get("fp", ""),
+                exec_ok=bool(run_result.get("ok")),
+                answer=run_result.get("answer", ""),
+                eval_pass=eval_result.get("pass"),
+                eval_critique=eval_result.get("critique", ""),
+            )
+
+            if eval_result.get("pass"):
+                # For question tasks: run an independent code-level re-verification.
+                # This is the graded-run equivalent of the local oracle gate — it re-queries
+                # the live AppWorld APIs to cross-check the answer without needing world.evaluate().
+                if task_kind == "question" and run_result.get("ok") and run_result.get("answer"):
+                    verify_result = verify_with_code(ctx, plan, run_result)
+                    skill_lib.log_execution(
+                        session_id=session_id,
+                        task_key=task_key,
+                        replan_iter=replan_iter,
+                        attempt=0,
+                        phase="verify_code",
+                        code_fp=solution.get("fp", ""),
+                        exec_ok=bool(run_result.get("ok")),
+                        answer=run_result.get("answer", ""),
+                        eval_pass=verify_result.get("pass"),
+                        eval_critique=verify_result.get("reason", ""),
+                    )
+                    if not verify_result.get("pass") and replan_iter <= MAX_REPLAN_ITERATIONS:
+                        # Verifier found a mismatch — replan with the discrepancy as critique
+                        eval_result = {
+                            "pass": False,
+                            "critique": verify_result.get("reason", ""),
+                            "missing_steps": [],
+                        }
+                        _log("solve", replan_iter=replan_iter, verify_with_code="FAIL",
+                             reason=eval_result["critique"][:200])
                     else:
-                        _log("solve", replan_iter=replan_iter, verify_with_code="PASS")
+                        if not verify_result.get("pass"):
+                            _log("solve", note="verifier failed but replan budget exhausted — submitting")
+                        else:
+                            _log("solve", replan_iter=replan_iter, verify_with_code="PASS")
+                        _log("solve", replan_iter=replan_iter, evaluation="PASS")
+                        break
+                else:
                     _log("solve", replan_iter=replan_iter, evaluation="PASS")
                     break
-            else:
-                _log("solve", replan_iter=replan_iter, evaluation="PASS")
+
+            eval_critique = eval_result.get("critique", "")
+            eval_missing_steps = eval_result.get("missing_steps") or []
+            _log("solve", replan_iter=replan_iter, evaluation="FAIL", critique=eval_critique[:200])
+
+            if replan_iter > MAX_REPLAN_ITERATIONS:
+                _log("solve", note="max_replan_iterations_reached")
                 break
 
-        eval_critique = eval_result.get("critique", "")
-        eval_missing_steps = eval_result.get("missing_steps") or []
-        _log("solve", replan_iter=replan_iter, evaluation="FAIL", critique=eval_critique[:200])
+        all_apps = list(set(apps + [
+            h.get("app") for h in plan.get("api_hints", []) if h.get("app")
+        ]))
+        api_sequence = [
+            f"{h.get('app')}.{h.get('api')}"
+            for h in plan.get("api_hints", [])
+            if h.get("app")
+        ]
 
-        if replan_iter > MAX_REPLAN_ITERATIONS:
-            _log("solve", note="max_replan_iterations_reached")
-            break
+    except _AgentTimeout:
+        timed_out = True
+        _log("solve", status="timeout", note="5-minute deadline reached — submitting best answer so far")
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
 
     answer = _format_task_answer(run_result.get("answer", ""), instruction)
     run_result["answer"] = answer
-    _log("solve", final_answer=answer, execution_ok=run_result.get("ok"))
+    _log("solve", final_answer=answer, execution_ok=run_result.get("ok"), timed_out=timed_out)
 
     _submit(ctx, task_kind, answer)
 
-    all_apps = list(set(apps + [
-        h.get("app") for h in plan.get("api_hints", []) if h.get("app")
-    ]))
-    api_sequence = [
-        f"{h.get('app')}.{h.get('api')}"
-        for h in plan.get("api_hints", [])
-        if h.get("app")
-    ]
-
-    if run_result.get("ok"):
-        code = _strip_token_preamble(solution.get("code", ""))
-        if code:
-            sname = skill_name_for(instruction, all_apps)
-            skill_lib.add_skill(
-                name=sname,
-                apps=all_apps,
-                description=instruction[:200],
-                code=code[:1500],
-                tags=[task_kind] + all_apps,
-            )
-            _log("solve", skill_saved=sname)
-
-        skill_lib.log_task(task_key, all_apps, task_kind, api_sequence, answer, success=True)
-
-        wins = mem.get("wins", {}) if isinstance(mem, dict) else {}
-        if not isinstance(wins, dict):
-            wins = {}
-        wins[task_key] = {
-            "apps": all_apps,
-            "task_kind": task_kind,
-            "questions": [q.get("question") for q in plan.get("questions", [])[:5]],
-            "api_sequence": api_sequence,
-        }
-        ctx.memory.write("wins", wins)
-        _log("solve", memory_write="wins", task_key=task_key)
-    else:
-        skill_lib.log_task(task_key, all_apps, task_kind, api_sequence, answer, success=False)
-
-    # Local-only: oracle verdict → learn corrected skills from failures
-    env = _local_env(ctx)
-    if env is not None:
-        try:
-            oracle_verdict = env.world.evaluate().to_dict()
-            if not oracle_verdict.get("success"):
-                clean_code = _strip_token_preamble(solution.get("code", ""))
-                learned = learn_from_oracle_feedback(
-                    ctx, skill_lib,
-                    instruction=instruction,
+    if not timed_out and skill_lib is not None:
+        if run_result.get("ok"):
+            code = _strip_token_preamble(solution.get("code", ""))
+            if code:
+                sname = skill_name_for(instruction, all_apps)
+                skill_lib.add_skill(
+                    name=sname,
                     apps=all_apps,
-                    task_kind=task_kind,
-                    failed_code=clean_code,
-                    oracle_verdict=oracle_verdict,
-                    answer=answer,
+                    description=instruction[:200],
+                    code=code[:1500],
+                    tags=[task_kind] + all_apps,
                 )
-                if learned:
-                    _log("solve", oracle_skill_learned=learned)
-        except Exception as exc:
-            _log("solve", oracle_learn_error=str(exc)[:150])
+                _log("solve", skill_saved=sname)
 
-    skill_lib.close()
+            skill_lib.log_task(task_key, all_apps, task_kind, api_sequence, answer, success=True)
+
+            if wins_store is not None:
+                questions = [q.get("question", "") for q in plan.get("questions", [])[:5]]
+                wins_store.add_win(instruction, all_apps, task_kind, questions, code, api_sequence)
+                _log("solve", wins_store_saved=task_key)
+        else:
+            skill_lib.log_task(task_key, all_apps, task_kind, api_sequence, answer, success=False)
+
+        # Local-only: oracle verdict → learn corrected skills from failures
+        env = _local_env(ctx)
+        if env is not None:
+            try:
+                oracle_verdict = env.world.evaluate().to_dict()
+                if not oracle_verdict.get("success"):
+                    clean_code = _strip_token_preamble(solution.get("code", ""))
+                    learned = learn_from_oracle_feedback(
+                        ctx, skill_lib,
+                        instruction=instruction,
+                        apps=all_apps,
+                        task_kind=task_kind,
+                        failed_code=clean_code,
+                        oracle_verdict=oracle_verdict,
+                        answer=answer,
+                    )
+                    if learned:
+                        _log("solve", oracle_skill_learned=learned)
+            except Exception as exc:
+                _log("solve", oracle_learn_error=str(exc)[:150])
+
+    if skill_lib is not None:
+        skill_lib.close()
     _log("solve", status="finished")

@@ -24,6 +24,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -33,6 +34,12 @@ from flywheel.ctx import Ctx  # noqa: E402
 from agent import solve  # noqa: E402
 
 PROXY_URL = os.environ.get("FLYWHEEL_URL", "https://homodeus-flywheel.fly.dev") + "/v1"
+SOLVE_TIMEOUT_SECONDS = 300  # must match agent.py
+
+
+def _fmt(seconds: float) -> str:
+    m, s = divmod(int(seconds), 60)
+    return f"{m}m{s:02d}s" if m else f"{s}s"
 
 
 def _api_docs_retriever():
@@ -126,20 +133,22 @@ def run_one(tid, key, memory_dir, verbose=False):
         env=env,
         retriever=_api_docs_retriever(),
     )
+    t0 = time.time()
     try:
         solve(ctx)
     except NotImplementedError:
         env.close()
         os.unlink(trace_path)
-        return None, None, []
+        return None, None, [], 0.0
     except Exception:
         traceback.print_exc()
+    elapsed = time.time() - t0
 
     verdict = env.world.evaluate().to_dict()
     events = _read_trace(trace_path)
     env.close()
     os.unlink(trace_path)
-    return bool(verdict.get("success")), verdict, events
+    return bool(verdict.get("success")), verdict, events, elapsed
 
 
 def main():
@@ -174,6 +183,7 @@ def main():
     print(f"tasks: {ids}\n")
 
     results = []
+    total_start = time.time()
     for tid in ids:
         if a.memory_off:
             # Fresh tmpdir per task for true off-arm isolation
@@ -181,7 +191,7 @@ def main():
         else:
             task_mem = mem_root
 
-        ok, verdict, events = run_one(tid, key, task_mem, verbose=a.verbose)
+        ok, verdict, events, elapsed = run_one(tid, key, task_mem, verbose=a.verbose)
 
         if a.memory_off:
             shutil.rmtree(task_mem, ignore_errors=True)
@@ -190,11 +200,12 @@ def main():
             print("agent.py is still the skeleton (NotImplementedError). Implement solve(ctx), then rerun.")
             return
 
-        results.append((tid, ok))
+        results.append((tid, ok, elapsed))
         status = "PASS" if ok else "FAIL"
         model_calls = sum(1 for e in events if e.get("type") == "model")
         reflects = sum(1 for e in events if e.get("type") == "reflect")
-        print(f"  {tid:14s}  {status}  (model={model_calls} reflect={reflects})")
+        timeout_warn = "  ⚠ near timeout" if elapsed > 240 else ""
+        print(f"  {tid:14s}  {status}  {elapsed:6.1f}s  (model={model_calls} reflect={reflects}){timeout_warn}")
 
         if not ok or a.verbose:
             _print_oracle_why(verdict)
@@ -205,9 +216,14 @@ def main():
     if _cleanup_tmp:
         shutil.rmtree(_cleanup_tmp, ignore_errors=True)
 
-    passed = sum(1 for _, ok in results if ok)
+    passed = sum(1 for _, ok, _ in results if ok)
+    total_elapsed = time.time() - total_start
+    times = [t for _, _, t in results]
+    avg = sum(times) / len(times) if times else 0.0
+    slowest = max(times) if times else 0.0
     arm = "memory off" if a.memory_off else f"memory on  →  commit memory/ to ship skills"
     print(f"\nTGC: {passed}/{len(results)}  ({arm})")
+    print(f"Time: total={_fmt(total_elapsed)}  avg={avg:.1f}s/task  slowest={slowest:.1f}s  (timeout={SOLVE_TIMEOUT_SECONDS}s)")
 
 
 if __name__ == "__main__":
