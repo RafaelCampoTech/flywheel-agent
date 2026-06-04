@@ -4,5 +4,8 @@ data/
 __pycache__/
 *.pyc
 .memory/
+**/.memory/
+**/chroma_db/
 experiments/
 .runs/
+api_docs_dump/
