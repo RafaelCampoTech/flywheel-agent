@@ -1025,6 +1025,207 @@ def verify_solution(
     }
 
 
+def critique_code(
+    ctx,
+    plan: Dict[str, Any],
+    code: str,
+    stdout: str,
+) -> Dict[str, Any]:
+    """
+    Review compiled+executed code against the task objective.
+
+    Returns:
+      {
+        "pass":        bool,   True = no actionable issues found
+        "issues":      [str],  specific problems (empty when pass=True)
+        "needs_rag":   bool,   True = a required API call is missing; RAG needed
+        "rag_queries": [str],  search queries to find the missing API docs
+      }
+    """
+    sys_prompt = (
+        "You are a code critic for an AppWorld agent task.\n"
+        "The code ran without a traceback. Review it against the task objective and plan "
+        "to identify issues that would produce a WRONG answer.\n"
+        "\n"
+        "Check for:\n"
+        "1. Missing API calls — e.g. task needs album song IDs but show_album is never called.\n"
+        "   → set needs_rag=true and provide rag_queries to find the missing API.\n"
+        "2. Missing pagination — a list endpoint is called once (page_index=0 only) when the "
+        "   task requires ALL items.\n"
+        "3. Wrong filter / wrong field — wrong condition, wrong dict key, off-by-one.\n"
+        "4. Missing data union — task says 'song library + album library + playlist library' "
+        "   but code queries only one source.\n"
+        "5. Null / KeyError risk — accessing response fields without .get() on a path that "
+        "   can be None or missing.\n"
+        "\n"
+        "Rules:\n"
+        "- Only flag issues you are CONFIDENT about from reading the code.\n"
+        "- Do NOT flag style, verbosity, or minor inefficiencies.\n"
+        "- If the code looks correct, return pass=true with an empty issues list.\n"
+        "\n"
+        "Reply JSON only:\n"
+        "{\n"
+        '  "pass": true,\n'
+        '  "issues": [],\n'
+        '  "needs_rag": false,\n'
+        '  "rag_queries": []\n'
+        "}"
+    )
+    user: Dict[str, Any] = {
+        "task_instruction": plan.get("instruction"),
+        "task_kind": plan.get("task_kind"),
+        "plan_steps": [q.get("question") for q in plan.get("questions", [])],
+        "api_hints_loaded": [
+            f"{h.get('app')}.{h.get('api')}" for h in plan.get("api_hints", []) if h.get("app")
+        ],
+        "code": (code or "")[-2500:],
+        "stdout_tail": (stdout or "")[-400:],
+    }
+    out = _model_text(
+        ctx,
+        [{"role": "system", "content": sys_prompt},
+         {"role": "user", "content": json.dumps(user, ensure_ascii=False)}],
+        json_mode=True,
+    )
+    parsed = _parse_json(out)
+    result: Dict[str, Any] = {
+        "pass": bool(parsed.get("pass", True)),
+        "issues": parsed.get("issues") or [],
+        "needs_rag": bool(parsed.get("needs_rag", False)),
+        "rag_queries": parsed.get("rag_queries") or [],
+    }
+    _log("critique_code", pass_=result["pass"], issues=result["issues"], needs_rag=result["needs_rag"])
+    return result
+
+
+def adapt_code_with_critique(
+    ctx,
+    plan: Dict[str, Any],
+    code: str,
+    critique: Dict[str, Any],
+    extra_api_defs: Optional[List[Dict[str, Any]]] = None,
+) -> str:
+    """
+    Refactor code to fix issues identified by critique_code.
+    New API definitions (from RAG) are injected when the critique flagged missing calls.
+    """
+    ctx_data = _common_codegen_context(plan)
+    issues_text = "\n".join(f"- {i}" for i in critique.get("issues", []))
+
+    sys = (
+        "Refactor AppWorld Python code to fix specific issues flagged by a code critic.\n"
+        "The code ran without errors but likely produces a WRONG answer.\n"
+        "\n"
+        "Rules:\n"
+        "- Fix ONLY the flagged issues; preserve all correct portions of the code.\n"
+        "- If new API definitions are provided, use them for the missing calls.\n"
+        "- Do NOT remove working logic unless it directly conflicts with a fix.\n"
+        + _codegen_base_sys(plan, ctx_data)
+        + f"\n\nCritic issues to fix:\n{issues_text}\n"
+    )
+
+    user = _codegen_user_base(plan, ctx_data)
+    user["current_code"] = (code or "")[-2000:]
+    user["critic_issues"] = critique.get("issues", [])
+    if extra_api_defs:
+        user["new_api_definitions"] = [
+            {
+                "app": d.get("app"),
+                "api": d.get("api"),
+                "definition": (d.get("definition_text") or "")[:500],
+            }
+            for d in extra_api_defs[:5]
+        ]
+
+    out = _model_text(ctx, [
+        {"role": "system", "content": sys},
+        {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
+    ], json_mode=True)
+    adapted = _sanitize_appworld_code(_parse_json(out).get("code", ""))
+    _log("adapt_code_with_critique", code_len=len(adapted))
+    return adapted
+
+
+def _critique_and_adapt(
+    ctx,
+    plan: Dict[str, Any],
+    solution: Dict[str, Any],
+    run_result: Dict[str, Any],
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """
+    Post-execution critique gate (runs only after successful execution).
+
+    Flow:
+      critique_code → pass?  → return unchanged
+                    → fail?  → needs_rag? → retrieve missing API docs
+                             → adapt_code_with_critique
+                             → execute adapted code
+                             → return updated (run_result, solution)
+    """
+    critique = critique_code(ctx, plan, solution.get("code", ""), run_result.get("stdout", ""))
+
+    if critique.get("pass"):
+        return run_result, solution
+
+    _log("_critique_and_adapt", issues=critique["issues"], needs_rag=critique["needs_rag"])
+    ctx.reflect(
+        "critique found issues after successful execution: "
+        + "; ".join(str(i) for i in critique["issues"][:3])
+    )
+
+    # Fetch missing API docs if the critique asked for them
+    extra_defs: List[Dict[str, Any]] = []
+    if critique.get("needs_rag"):
+        already_loaded: set = {
+            (h.get("app"), h.get("api")) for h in plan.get("api_hints", []) if h.get("app")
+        }
+        fetched_this_round: set = set()
+        for q in critique.get("rag_queries", []):
+            if not (q or "").strip():
+                continue
+            rag_docs = retrieve_relevant_docs(ctx, q)
+            new_defs = fetch_api_definitions(rag_docs)
+            for d in new_defs:
+                key = (d.get("app"), d.get("api"))
+                if key in already_loaded or key in fetched_this_round or not d.get("app"):
+                    continue  # skip already-loaded or duplicate RAG hits
+                fetched_this_round.add(key)
+                defn = d.get("definition_text", "")
+                plan.setdefault("api_hints", []).append({
+                    "step": None,
+                    "question": q,
+                    "suggested_api": f"{d.get('app')}.{d.get('api')}",
+                    "definition_text": defn,
+                    "paginated": _endpoint_has_pagination(defn),
+                    "rerank_reason": "critique-rag",
+                })
+                extra_defs.append(d)
+        _log("_critique_and_adapt", rag_defs_fetched=len(extra_defs))
+
+    adapted_code = adapt_code_with_critique(ctx, plan, solution.get("code", ""), critique, extra_defs)
+    if not adapted_code:
+        _log("_critique_and_adapt", status="no adapted code produced — keeping original")
+        return run_result, solution
+
+    tokens_literal = json.dumps(plan.get("access_tokens") or {})
+    clean = _strip_token_preamble(adapted_code)  # remove any access_tokens line the LLM copied
+    raw = f"access_tokens = {tokens_literal}\n{clean}"
+    fp = hashlib.md5(raw.encode("utf-8", errors="replace")).hexdigest()[:8]
+    full_code = f"# codegen_fp={fp}\n{raw}"
+    new_solution = {"code": full_code, "fp": fp}
+
+    new_run_result = execute_code(ctx, full_code, attempt=200)  # 200 marks critique-adaptation
+    _log("_critique_and_adapt", adapted_exec_ok=new_run_result.get("ok"),
+         answer=new_run_result.get("answer", ""))
+
+    # Only swap in the adapted result if it executed cleanly
+    if new_run_result.get("ok"):
+        return new_run_result, new_solution
+
+    _log("_critique_and_adapt", status="adapted code failed execution — keeping original result")
+    return run_result, solution
+
+
 def analyse_code_error(
     ctx,
     plan: Dict[str, Any],
@@ -1178,6 +1379,7 @@ def check_loop(
         run_result = execute_code(ctx, solution.get("code", ""), attempt=attempt)
 
         if run_result.get("ok"):
+            run_result, solution = _critique_and_adapt(ctx, plan, solution, run_result)
             verdict = verify_solution(ctx, plan, run_result)
             passed = verdict.get("pass", False)
             feedback = verdict.get("reason", "")
@@ -1500,7 +1702,8 @@ def build_plan(
         "Do NOT include a final formatting step — synthesis happens after all probes.\n"
         "Keep the plan short (3-8 items). Be specific about apps and data needed.\n"
         "Use memory from prior tasks if provided:\n"
-        "- proven_plans: exact question sequences that solved similar tasks before — copy the structure if it fits.\n"
+        "- proven_plans: winning recipes (questions + code_preview) from similar past tasks.\n"
+        "  Copy the question structure exactly when it fits — the code_preview shows the proven API call pattern.\n"
         "- memory_skills: working code patterns with API names — use their api_sequence_hint to order your steps.\n"
         "- similar_tasks: recent successful api_sequences for the same apps — adapt directly.\n"
         "Reuse what already worked. Do not rediscover.\n"
@@ -1518,7 +1721,16 @@ def build_plan(
         "task_kind": task_kind,
         "apps": apps,
         "access_tokens_available": list((access_tokens or {}).keys()),
-        "proven_plans": prior_plans or [],
+        "proven_plans": [
+            {
+                "apps": p.get("apps"),
+                "task_kind": p.get("task_kind"),
+                "questions": p.get("questions") or [],
+                "api_sequence": p.get("api_sequence") or [],
+                "code_preview": (p.get("code") or "")[:300],
+            }
+            for p in (prior_plans or [])
+        ],
     }
     if task_objective:
         user["task_objective"] = task_objective
@@ -1588,14 +1800,26 @@ def build_plan(
         "probes": [],
     }
     _log("build_plan", question_count=len(normalized))
-    plan = enrich_plan_with_rag(plan)
 
-    # Validate API candidates: one LLM call picks best API per step from top-3 RAG results
-    plan = _validate_plan_apis_batch(ctx, plan)
-
-    # Technical brief: spec for code generation (API sequence, pagination, fields, ANSWER format)
-    code_plan = _build_code_plan(ctx, plan)
-    plan["code_plan"] = code_plan
+    # Fingerprint the question set to detect unchanged plans on replan
+    q_texts = tuple(q.get("question", "") for q in plan["questions"])
+    q_fp = hashlib.md5(" | ".join(q_texts).encode("utf-8", errors="replace")).hexdigest()[:8]
+    cached_hints = getattr(build_plan, "_hint_cache", {})
+    if q_fp in cached_hints:
+        _log("build_plan", rag_skipped="questions unchanged — reusing api_hints and code_plan")
+        plan["api_hints"] = cached_hints[q_fp]["api_hints"]
+        plan["code_plan"] = cached_hints[q_fp]["code_plan"]
+    else:
+        plan = enrich_plan_with_rag(plan)
+        plan = _validate_plan_apis_batch(ctx, plan)
+        code_plan = _build_code_plan(ctx, plan)
+        plan["code_plan"] = code_plan
+        if not hasattr(build_plan, "_hint_cache"):
+            build_plan._hint_cache = {}
+        build_plan._hint_cache[q_fp] = {
+            "api_hints": plan["api_hints"],
+            "code_plan": plan["code_plan"],
+        }
 
     print_plan(plan, title="PLAN (with validated APIs)")
     return plan
@@ -1654,6 +1878,17 @@ def _codegen_base_sys(plan: Dict[str, Any], ctx_data: Dict[str, Any]) -> str:
         "Tasks that need 'all songs', 'every item', or library-wide stats require pagination\n"
         "on every paginated list API (song library, album library, playlist library, etc.).\n"
         "Do NOT call apis.supervisor.complete_task().\n"
+        "\n"
+        "CRITICAL — AVOID THESE COMMON MISTAKES:\n"
+        "1. INCOMPLETE CODE: write a complete, runnable script. Never leave a variable or\n"
+        "   expression half-written (e.g. `genr` instead of `genre = ...`). The JSON 'code'\n"
+        "   field must end with a complete statement.\n"
+        "2. PAGE_INDEX RESET: reset `page_index = 0` before EACH separate pagination loop.\n"
+        "   Reusing the variable from the previous loop silently skips all pages.\n"
+        "3. HALLUCINATED PARAMS: only pass parameters listed in the api_hints definition_text.\n"
+        "   Never invent flags like `is_public=`, `sort_by=`, or `limit=` unless documented.\n"
+        "4. SAFE FIELD ACCESS: use `.get()` for every response field that could be None or\n"
+        "   missing. Never index a response dict directly without a guard.\n"
     )
     if paginated_apis:
         sys += f"\nPaginated APIs in this plan (must loop): {', '.join(paginated_apis)}\n"
@@ -1690,8 +1925,130 @@ def _codegen_user_base(plan: Dict[str, Any], ctx_data: Dict[str, Any]) -> Dict[s
     }
 
 
+def _codegen_step_fragment(
+    ctx,
+    step: Dict[str, Any],
+    hint: Dict[str, Any],
+    preceding_questions: List[str],
+    ctx_data: Dict[str, Any],
+) -> Tuple[int, str]:
+    """Generate a focused code snippet for a single plan step.
+
+    Each fragment is independent — the merge step stitches them into one script.
+    """
+    step_num  = step.get("step", 0)
+    question  = step.get("question", "")
+    api_name  = f"{hint.get('app')}.{hint.get('api')}" if hint.get("app") else "?"
+    defn      = (hint.get("definition_text") or "")[:600]
+    paginated = hint.get("paginated", False)
+
+    sys = (
+        "Write a Python code SNIPPET for ONE step of an AppWorld task.\n"
+        "This snippet will be combined with snippets from other steps — write ONLY this step's logic.\n"
+        "\n"
+        "Rules:\n"
+        f"- `apis` and `access_tokens` (keys: {ctx_data['available_tokens']}) are in scope.\n"
+        "- Do NOT add token login code or ANSWER printing — those go in the surrounding script.\n"
+        "- Do NOT re-initialize variables that a previous step already created.\n"
+        "- Use clear, consistent variable names so the merge step can wire snippets together.\n"
+        "- Write COMPLETE code — never leave an expression half-finished.\n"
+        "- Only pass parameters that appear in the API definition below.\n"
+    )
+    if paginated:
+        sys += (
+            "- This endpoint is paginated: loop `page_index = 0, 1, 2…` until batch is empty or short.\n"
+            "- Reset `page_index = 0` at the start of THIS loop — never reuse from a previous loop.\n"
+        )
+    sys += 'Reply JSON: {"snippet": "..."}'
+
+    user = {
+        "step": step_num,
+        "step_question": question,
+        "api": api_name,
+        "api_definition": defn,
+        "preceding_steps": preceding_questions,
+    }
+    out = _model_text(ctx, [
+        {"role": "system", "content": sys},
+        {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
+    ], json_mode=True)
+    snippet = _sanitize_appworld_code(_parse_json(out).get("snippet", ""))
+    _log("_codegen_step_fragment", step=step_num, api=api_name, snippet_len=len(snippet))
+    return step_num, snippet
+
+
+def _codegen_merge_fragments(
+    ctx,
+    plan: Dict[str, Any],
+    fragments: List[Tuple[int, str]],
+    ctx_data: Dict[str, Any],
+) -> str:
+    """Assemble per-step snippets into one complete, coherent runnable script.
+
+    This is lighter than a full scratch generation: the per-step logic is already done;
+    the merge only needs to wire variables, add preamble, and apply output formatting.
+    """
+    ordered = sorted(fragments, key=lambda x: x[0])
+    sys = (
+        "Assemble these per-step Python snippets into ONE complete, runnable script.\n"
+        "\n"
+        "Rules:\n"
+        "- Preserve ALL logic from each snippet; only fix variable name clashes or missing inits.\n"
+        "- Add the token preamble: `tok = access_tokens['app']` for each required app.\n"
+        "- Ensure no variable is used before it is defined.\n"
+        "- Keep the step order exactly as given.\n"
+        + _codegen_base_sys(plan, ctx_data)
+    )
+    user: Dict[str, Any] = {
+        "task_instruction": plan.get("instruction"),
+        "task_kind": plan.get("task_kind"),
+        "step_snippets": [{"step": n, "snippet": s} for n, s in ordered],
+        "access_tokens_available": ctx_data["available_tokens"],
+    }
+    out = _model_text(ctx, [
+        {"role": "system", "content": sys},
+        {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
+    ], json_mode=True)
+    merged = _sanitize_appworld_code(_parse_json(out).get("code", ""))
+    _log("_codegen_merge_fragments", fragments=len(fragments), merged_len=len(merged))
+    return merged
+
+
 def _codegen_scratch(ctx, plan: Dict[str, Any], ctx_data: Dict[str, Any]) -> str:
-    """Scenario 1: Generate new code from API definitions and code plan."""
+    """Scenario 1: Generate new code from scratch.
+
+    For plans with 2+ steps: generate each step fragment in parallel then merge.
+    For single-step plans: one direct LLM call (no merge overhead).
+    """
+    steps = plan.get("questions", [])
+    if len(steps) >= 2:
+        hints_by_step = {
+            h.get("step"): h for h in plan.get("api_hints", []) if h.get("step") is not None
+        }
+        # Build ordered list of preceding questions per step for context
+        questions_in_order = [s.get("question", "") for s in sorted(steps, key=lambda s: s.get("step", 0))]
+
+        def _gen_fragment(step: Dict[str, Any]) -> Tuple[int, str]:
+            idx = step.get("step", 0)
+            preceding = questions_in_order[: max(0, idx - 1)]
+            return _codegen_step_fragment(
+                ctx, step, hints_by_step.get(idx, {}), preceding, ctx_data
+            )
+
+        workers = min(_MAX_RAG_WORKERS, len(steps))
+        fragments: List[Tuple[int, str]] = []
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_gen_fragment, step): step.get("step") for step in steps}
+            for fut in as_completed(futures):
+                try:
+                    fragments.append(fut.result())
+                except Exception as exc:
+                    _log("_codegen_scratch", step=futures[fut], fragment_error=str(exc))
+
+        if fragments:
+            return _codegen_merge_fragments(ctx, plan, fragments, ctx_data)
+
+    # Single-step or fragment generation completely failed → direct call
     sys = (
         "Generate a new implementation from scratch.\n"
         "Use the API definitions (api_hints) and code plan as primary inputs.\n"
@@ -1760,8 +2117,80 @@ def _codegen_repair(
     return _sanitize_appworld_code(_parse_json(out).get("code", ""))
 
 
+def _best_win_candidate(plan: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return the best Chroma win for Scenario 0 (adapt-from-win), or None.
+
+    Requires app overlap and non-empty code so unrelated wins don't pollute generation.
+    """
+    task_apps = set(plan.get("apps") or [])
+    for win in (plan.get("prior_wins") or []):
+        win_apps = set(win.get("apps") or [])
+        if win_apps & task_apps and win.get("code", "").strip():
+            return win
+    return None
+
+
+def _codegen_from_win(
+    ctx,
+    plan: Dict[str, Any],
+    win: Dict[str, Any],
+    ctx_data: Dict[str, Any],
+) -> str:
+    """Scenario 0: Adapt the closest Chroma winning recipe to the current task.
+
+    Much shorter prompt than scratch/adapt — the winning code already encodes
+    pagination patterns, auth, data-union logic, and answer formatting.
+    We only tell the model WHAT changed, not HOW to write AppWorld code.
+    """
+    available_tokens = ctx_data["available_tokens"]
+    code_plan = ctx_data["code_plan"]
+
+    sys = (
+        "A proven winning solution for a similar task already exists.\n"
+        "Adapt it to the current task with the MINIMUM changes needed.\n"
+        "\n"
+        "Rules:\n"
+        "1. If the existing code already handles this task correctly, return it unchanged.\n"
+        "2. Change only what differs — e.g. genre filter value, top-N count, app name, field name.\n"
+        "3. Keep ALL pagination loops, auth patterns, and data-union logic intact.\n"
+        "4. Do NOT add explanations or restructure working sections.\n"
+        "5. Write COMPLETE code — never leave a variable or expression half-written.\n"
+        "   The JSON 'code' field must end with a complete statement.\n"
+        "6. Reset `page_index = 0` before EACH pagination loop — never reuse from a prior loop.\n"
+        "7. Only pass parameters listed in the API docs — never invent flags.\n"
+        "8. Use `.get()` for every response field that could be None — never index without a guard.\n"
+        "\n"
+        f"`apis` is in scope. `access_tokens` has keys: {available_tokens}.\n"
+        "Do NOT call apis.supervisor.complete_task().\n"
+    )
+    if code_plan:
+        sys += f"\nTECHNICAL BRIEF (validate your changes against this):\n{code_plan[:600]}\n"
+    if plan.get("task_kind") == "question":
+        sys += "\nEnd with: print('ANSWER=' + ANSWER)\n"
+    sys += 'Reply JSON: {"code":"..."}.'
+
+    user = {
+        "current_task": plan.get("instruction"),
+        "current_plan": [q.get("question") for q in plan.get("questions", [])],
+        "winning_task": win.get("description") or "",
+        "winning_plan": win.get("questions") or [],
+        "winning_code": win.get("code", ""),
+    }
+
+    out = _model_text(ctx, [
+        {"role": "system", "content": sys},
+        {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
+    ], json_mode=True)
+    adapted = _sanitize_appworld_code(_parse_json(out).get("code", ""))
+    if not adapted:
+        # LLM returned unparseable output — use the winning code directly
+        _log("_codegen_from_win", fallback="empty LLM output, returning winning code as-is")
+        adapted = _sanitize_appworld_code(win.get("code", ""))
+    return adapted
+
+
 def _best_skill_candidate(plan: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Return the best relevant skill for Scenario 2, or None if none qualify.
+    """Return the best relevant skill for Scenario 2 (adapt-from-skill), or None.
 
     Requires app overlap so generic helper skills (pagination template, login
     bootstrap) don't trigger Scenario 2 on unrelated tasks.
@@ -1783,11 +2212,13 @@ def generate_solution_code(
 ) -> Dict[str, Any]:
     """Route code generation to the appropriate scenario.
 
-    Scenario 1 (scratch):  no previous code and no matching skill in memory.
+    Scenario 0 (win):      first attempt AND a Chroma win with matching apps exists.
+                           Uses a token-lean prompt — the winning code carries the structure.
+    Scenario 1 (scratch):  no previous code, no matching win, no matching skill.
     Scenario 2 (adapt):    no failure, but a proven skill with matching apps exists.
     Scenario 3 (repair):   previous code failed — fix using error info and API definitions.
 
-    API definitions (api_hints) and code plan are passed to all three scenarios.
+    API definitions (api_hints) and code plan are passed to all scenarios.
     """
     _log(
         "generate_solution_code",
@@ -1802,14 +2233,20 @@ def generate_solution_code(
         _log("generate_solution_code", scenario="repair")
         code = _codegen_repair(ctx, plan, failed_code, last_error, check_feedback, ctx_data)
     else:
-        best_skill = _best_skill_candidate(plan)
-        if best_skill:
-            _log("generate_solution_code", scenario="adapt",
-                 skill=best_skill["name"], success_count=best_skill.get("success_count", 1))
-            code = _codegen_adapt(ctx, plan, best_skill["code"], ctx_data)
+        best_win = _best_win_candidate(plan)
+        if best_win:
+            _log("generate_solution_code", scenario="win",
+                 win_task=(best_win.get("description") or "")[:80])
+            code = _codegen_from_win(ctx, plan, best_win, ctx_data)
         else:
-            _log("generate_solution_code", scenario="scratch")
-            code = _codegen_scratch(ctx, plan, ctx_data)
+            best_skill = _best_skill_candidate(plan)
+            if best_skill:
+                _log("generate_solution_code", scenario="adapt",
+                     skill=best_skill["name"], success_count=best_skill.get("success_count", 1))
+                code = _codegen_adapt(ctx, plan, best_skill["code"], ctx_data)
+            else:
+                _log("generate_solution_code", scenario="scratch")
+                code = _codegen_scratch(ctx, plan, ctx_data)
 
     tokens_literal = json.dumps(plan.get("access_tokens") or {})
     raw_code = f"access_tokens = {tokens_literal}\n{code}" if code else ""
@@ -2009,22 +2446,34 @@ def solve(ctx):
     old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
     signal.alarm(SOLVE_TIMEOUT_SECONDS)
     try:
-        # Rich classification: kind + objective + expected_output + constraints
-        classification = task_classification(ctx)
-        task_kind = classification["kind"]
-        task_objective = classification.get("objective", instruction[:200])
+        # Phase 1 — classify task + detect apps in parallel (two independent LLM calls)
+        with ThreadPoolExecutor(max_workers=2) as _pool:
+            _f_cls = _pool.submit(task_classification, ctx)
+            _f_dom = _pool.submit(domain_classification, ctx)
+            classification = _f_cls.result()
+            apps          = _f_dom.result()
+
+        task_kind        = classification["kind"]
+        task_objective   = classification.get("objective", instruction[:200])
         task_constraints = classification.get("constraints") or []
 
-        # Domain classification for initial token bootstrap (keyword/model heuristic)
-        apps = domain_classification(ctx)
-        access_tokens = bootstrap_access_tokens(ctx, apps)
+        # Phase 2 — bootstrap_access_tokens must stay on the main thread (AppWorld uses
+        # signal.SIGALRM internally and signal.signal() only works on the main thread).
+        # Memory ops (SQLite + Chroma) have no such restriction → run them in a thread
+        # so they overlap with the bootstrap network call.
+        def _load_memory() -> tuple:
+            sl    = SkillLibrary(ctx.memory.dir)
+            ws    = WinsStore(ctx.memory.dir)
+            skills = sl.search(instruction, apps, top_k=4)
+            sim    = sl.similar_tasks(apps, task_kind, top_k=3)
+            wins   = ws.search(instruction, apps, top_k=3)
+            return sl, ws, skills, sim, wins
 
-        # --- Memory: load skills and wins before planning ---
-        skill_lib = SkillLibrary(ctx.memory.dir)
-        wins_store = WinsStore(ctx.memory.dir)
-        relevant_skills = skill_lib.search(instruction, apps, top_k=4)
-        similar_tasks = skill_lib.similar_tasks(apps, task_kind, top_k=3)
-        prior_plans = wins_store.search(instruction, apps, top_k=3)
+        with ThreadPoolExecutor(max_workers=1) as _pool:
+            _f_mem = _pool.submit(_load_memory)
+            access_tokens = bootstrap_access_tokens(ctx, apps)   # main thread (signals)
+            skill_lib, wins_store, relevant_skills, similar_tasks, prior_plans = _f_mem.result()
+
         _log("solve", skills_retrieved=len(relevant_skills), similar_tasks=len(similar_tasks),
              prior_plans=len(prior_plans))
 
@@ -2059,6 +2508,9 @@ def solve(ctx):
                 plan["access_tokens"] = access_tokens
                 _log("solve", extra_tokens_bootstrapped=new_apps)
 
+            # Attach Chroma wins so generate_solution_code can use them on first attempt
+            plan["prior_wins"] = prior_plans
+
             # Pass 2 skill search: plan questions are more precise than the raw instruction
             plan_queries = [q.get("question", "") for q in plan.get("questions", []) if q.get("question")]
             all_apps = list(set(apps + rag_apps))
@@ -2072,14 +2524,24 @@ def solve(ctx):
             plan["replan_iter"] = replan_iter
 
             run_result, solution = check_loop(ctx, plan, skill_lib=skill_lib)
+            oracle_confirmed = False
             if _local_env(ctx) is not None:
                 run_result, solution = _oracle_gate(ctx, plan, run_result, solution)
+                # Check if oracle already confirmed success — skip LLM evaluator in that case
+                try:
+                    oracle_confirmed = bool(_local_env(ctx).world.evaluate().to_dict().get("success"))
+                except Exception:
+                    pass
 
-            # Semantic evaluation: independent check that the objective was actually achieved
-            eval_result = evaluate_solution(
-                ctx, plan, solution.get("code", ""), run_result,
-                code_plan=plan.get("code_plan", ""), attempt=replan_iter,
-            )
+            # Semantic evaluation: skip when local oracle already confirmed correctness
+            if oracle_confirmed:
+                _log("solve", replan_iter=replan_iter, eval_skipped="oracle confirmed success")
+                eval_result = {"pass": True, "critique": "oracle confirmed", "missing_steps": []}
+            else:
+                eval_result = evaluate_solution(
+                    ctx, plan, solution.get("code", ""), run_result,
+                    code_plan=plan.get("code_plan", ""), attempt=replan_iter,
+                )
 
             # Persist the evaluate result alongside the last exec attempt for this iteration
             skill_lib.log_execution(
