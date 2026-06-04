@@ -38,6 +38,10 @@ class AppWorldEnv:
         sees answers submitted via apis.supervisor.complete_task, so you must call it."""
         return bool(self.world.evaluate().to_dict().get("success"))
 
+    def evaluate_full(self):
+        """Return the full oracle verdict dict (success, failures, traces)."""
+        return self.world.evaluate().to_dict()
+
     def close(self):
         try:
             self.world.close()

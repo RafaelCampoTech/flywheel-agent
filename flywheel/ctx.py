@@ -122,6 +122,12 @@ class Ctx:
             raise RuntimeError("ctx.evaluate is local-only; the grader runs the oracle itself")
         return self._env.evaluate()
 
+    def evaluate_full(self):
+        """Return the full oracle verdict dict (local only). Includes success, failures, traces."""
+        if self._env is None:
+            raise RuntimeError("ctx.evaluate_full is local-only; the grader runs the oracle itself")
+        return self._env.evaluate_full()
+
 
 class _LocalMCP:
     """Local stand-in for the graded MCP gateway, backed by in-process AppWorld so a ctx.mcp-based

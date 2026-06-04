@@ -71,10 +71,25 @@ def evaluate(
 
 
 def extract_answer_from_stdout(stdout: str | None) -> str | None:
-    """Pull the ANSWER= value from stdout, or return None."""
+    """Pull the ANSWER= value from stdout, or return None.
+
+    Normalizes Python list repr to comma-separated string so the oracle's
+    .split(',') works correctly: ['a', 'b'] → 'a, b'
+    """
     if not stdout or "ANSWER=" not in stdout:
         return None
-    return stdout.split("ANSWER=", 1)[1].strip().splitlines()[0].strip() or None
+    raw = stdout.split("ANSWER=", 1)[1].strip().splitlines()[0].strip()
+    if not raw:
+        return None
+    if raw.startswith("[") and raw.endswith("]"):
+        try:
+            import ast
+            items = ast.literal_eval(raw)
+            if isinstance(items, list):
+                return ", ".join(str(x).strip() for x in items)
+        except (ValueError, SyntaxError):
+            pass
+    return raw
 
 
 def has_error(result) -> bool:

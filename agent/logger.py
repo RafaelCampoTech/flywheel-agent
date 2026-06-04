@@ -189,5 +189,12 @@ def info(label: str, msg: str) -> None:
     _print(f"{_ts()} {_DIM}  {label}:{_R} {msg[:200]}")
 
 
+def oracle_result(passed: bool) -> None:
+    label = _B_GREEN if passed else _B_RED
+    icon = "✅" if passed else "❌"
+    verdict = "PASS — code promoted to memory" if passed else "FAIL — code discarded"
+    _print(f"{_ts()} {label}{icon} ORACLE{_R}  {verdict}")
+
+
 def error(label: str, msg: str) -> None:
     _print(f"{_ts()} {_RED}✗ {label}{_R}  {msg[:200]}")

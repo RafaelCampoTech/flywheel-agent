@@ -15,8 +15,11 @@ RULES — follow exactly:
 - For RESPONSE tasks: end with EXACTLY: print("ANSWER=" + str(ANSWER))
 - For ACTION tasks: perform the action. No print needed.
 - NEVER call complete_task inside the generated code.
-- Output format must match: number as int/float, list as comma-separated string,
-  yes/no as lowercase string, single value as exact text.
+- Output format must match: number as int/float, yes/no as lowercase string,
+  single value as exact text.
+- For list answers: ANSWER must be a comma-separated string, NOT a Python list.
+  Correct:   print("ANSWER=" + ", ".join(titles))
+  Wrong:     print("ANSWER=" + str(titles))
 - App name keys for tokens: spotify, amazon, gmail, phone, venmo, splitwise,
   todoist, simple_note, file_system.
 - Check API responses for errors before proceeding (check for "message" or "error" keys).
@@ -34,7 +37,7 @@ def _extract_code(raw: str) -> str:
     return raw.strip()
 
 
-def generate_scratch(ctx, plan: dict, docs: str) -> str:
+def generate_scratch(ctx, plan: dict, docs: str, code_plan: str = "") -> str:
     """Generate code from scratch based on plan and docs."""
     steps_text = "\n".join(
         f"  {s['step_id']}. [{s['app']}] {s['description']}"
@@ -45,7 +48,8 @@ def generate_scratch(ctx, plan: dict, docs: str) -> str:
         f"Task type: {plan['task_type']}\n"
         f"Expected output type: {plan.get('expected_output_type', 'none')}\n"
         f"Steps:\n{steps_text}\n\n"
-        f"API docs:\n{docs[:8000]}\n\n"
+        + (f"Code plan:\n{code_plan}\n\n" if code_plan else "")
+        + f"API docs:\n{docs[:8000]}\n\n"
         "Write the complete Python solution."
     )
     messages = [
@@ -59,7 +63,7 @@ def generate_scratch(ctx, plan: dict, docs: str) -> str:
     return code
 
 
-def generate_adapt(ctx, plan: dict, docs: str, similar_solution: dict) -> str:
+def generate_adapt(ctx, plan: dict, docs: str, similar_solution: dict, code_plan: str = "") -> str:
     """Adapt a previously working solution to the current task."""
     user_content = (
         f"Task: {plan['objective']}\n"
@@ -71,7 +75,8 @@ def generate_adapt(ctx, plan: dict, docs: str, similar_solution: dict) -> str:
         f"--- END ---\n\n"
         "Modify only the parts that differ for the current task. "
         "Preserve pagination logic, token usage, and error handling.\n\n"
-        f"API docs:\n{docs[:6000]}\n\n"
+        + (f"Code plan:\n{code_plan}\n\n" if code_plan else "")
+        + f"API docs:\n{docs[:6000]}\n\n"
         "Write the complete Python solution."
     )
     messages = [
@@ -82,6 +87,31 @@ def generate_adapt(ctx, plan: dict, docs: str, similar_solution: dict) -> str:
     response = ctx.model(messages)
     code = _extract_code(content_of(response))
     log.codegen_result("adapt", code)
+    return code
+
+
+def generate_oracle_repair(ctx, plan: dict, failed_code: str, oracle_diff: str) -> str:
+    """Lightweight oracle-guided repair. No docs — uses the oracle expected-vs-actual diff.
+
+    Intentionally short prompt to stay within token budget after the main repair loop.
+    """
+    user_content = (
+        f"Task: {plan['objective']}\n"
+        f"Task type: {plan['task_type']}\n"
+        f"Expected output type: {plan.get('expected_output_type', 'none')}\n\n"
+        f"This code produced the wrong answer:\n```python\n{failed_code[:2500]}\n```\n\n"
+        f"Oracle says (expected vs actual):\n{oracle_diff[:600]}\n\n"
+        "Fix the logic so the output matches the oracle's expected values. "
+        "Write the complete corrected Python solution."
+    )
+    messages = [
+        {"role": "system", "content": _SHARED_SYSTEM},
+        {"role": "user", "content": user_content},
+    ]
+    log.codegen_prompt("oracle_repair", _SHARED_SYSTEM, user_content)
+    response = ctx.model(messages)
+    code = _extract_code(content_of(response))
+    log.codegen_result("oracle_repair", code)
     return code
 
 

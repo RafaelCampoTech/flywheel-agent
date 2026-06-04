@@ -2,11 +2,13 @@
 
 import agent.logger as log
 from agent.bootstrap import bootstrap
-from agent.codegen import generate_adapt, generate_scratch
+from agent.codeplan import build_code_plan
+from agent.codegen import generate_adapt, generate_oracle_repair, generate_repair, generate_scratch
 from agent.evaluation import evaluate, extract_answer_from_stdout
-from agent.execution import complete_task, run_code
+from agent.execution import complete_task, make_preamble, run_code
 from agent.kv_memory import remember
 from memory.code_store import confirm_pending_success
+from memory.code_store import discard_pending
 from memory.code_store import get_pending_id
 from memory.code_store import search as mem_search
 from memory.code_store import write_pending
@@ -31,13 +33,15 @@ def solve(ctx):
 
     log.task_start(instruction)
 
-    # --- Step 2: Oracle check for previous task ---
-    log.step(2, "Oracle check")
-    try:
-        if get_pending_id():
-            confirm_pending_success()
-    except Exception:
-        pass
+    # --- Step 2: Oracle check for previous task (local only) ---
+    # Pending solutions are only written on local runs; graded runs have no pending file.
+    if getattr(ctx, "_env", None) is not None:
+        log.step(2, "Oracle check")
+        try:
+            if get_pending_id():
+                confirm_pending_success()
+        except Exception:
+            pass
 
     # --- Step 3: RAG ---
     log.step(3, "RAG retrieval")
@@ -67,6 +71,7 @@ def solve(ctx):
     log.step(4, "Memory search")
     try:
         similar_solutions = mem_search(instruction, top_k=3, rag_apis=api_names)
+        similar_solutions = [s for s in similar_solutions if s.get("working_code", "").strip()]
     except Exception as e:
         log.error("Memory search", str(e))
         similar_solutions = []
@@ -106,19 +111,31 @@ def solve(ctx):
     log.tokens_result(tokens)
 
     # --- Step 7: Code generation ---
+    # Code planning (2 LLM calls) only runs on the scratch path — adapt already has a template.
     log.step(7, "Code generation")
+    code_plan_str = ""
     try:
         if similar_solutions:
             code = generate_adapt(ctx, task_plan, docs_str, similar_solutions[0])
         else:
-            code = generate_scratch(ctx, task_plan, docs_str)
+            log.step("6.5", "Code planning")
+            try:
+                cp_result = build_code_plan(ctx, task_plan, docs_str, similar_solutions)
+                code_plan_str = cp_result["code_plan"]
+            except Exception as e:
+                log.error("Code planning", str(e))
+            if timer.at_emergency():
+                log.emergency("after code planning")
+                complete_task(ctx, None)
+                return
+            code = generate_scratch(ctx, task_plan, docs_str, code_plan=code_plan_str)
     except Exception as e:
         log.error("Codegen", str(e))
         code = f"# codegen failed: {e}\nprint('ANSWER=error')"
 
     # --- Step 8: Execute ---
     log.step(8, "Execute")
-    preamble = f"tokens = {repr(tokens)}\n"
+    preamble = make_preamble(tokens)
     try:
         stdout = run_code(ctx, preamble + code)
     except Exception as e:
@@ -144,6 +161,8 @@ def solve(ctx):
         log.eval_fail(eval_result["failure_reason"], eval_result["actual_output"], expected_type)
 
     # --- Step 10: Repair loop ---
+    # Cap at 2 attempts in test mode to reserve budget for oracle repair (Step 13).
+    _is_local = getattr(ctx, "_env", None) is not None
     if not eval_result["passed"]:
         log.step(10, "Repair loop")
         fixed_code, repair_stdout, last_failure = repair_loop(
@@ -154,6 +173,7 @@ def solve(ctx):
             failed_code=code,
             first_error=stdout,
             timer=timer,
+            max_attempts=2 if _is_local else 3,
         )
 
         if fixed_code is not None:
@@ -191,7 +211,7 @@ def solve(ctx):
 
                 try:
                     code = generate_scratch(ctx, task_plan, docs_str)
-                    preamble = f"tokens = {repr(tokens)}\n"
+                    preamble = make_preamble(tokens)
                     stdout = run_code(ctx, preamble + code)
                     best_stdout = stdout
                     log.exec_result(stdout)
@@ -228,8 +248,14 @@ def solve(ctx):
         complete_task(ctx, answer)
         log.finish(answer, timer.elapsed())
 
-    # --- Step 13: Persist to memory store ---
-    _persist(instruction, task_plan, code, api_names)
+    # --- Step 13: Oracle verify + repair loop (local only) ---
+    # Up to 3 oracle checks; on each failure feed the oracle diff to generate_repair,
+    # re-run, and re-submit. Only persist code that the oracle confirms correct.
+    if getattr(ctx, "_env", None) is not None:
+        log.step(13, "Oracle verify + persist")
+        _oracle_repair_loop(
+            ctx, task_plan, docs_str, tokens, code, instruction, api_names
+        )
 
     try:
         remember(ctx, "last_plan", str(task_plan)[:2000])
@@ -238,6 +264,8 @@ def solve(ctx):
 
 
 def _persist(instruction: str, task_plan: dict, code: str, api_names: list) -> None:
+    if not code or not code.strip():
+        return
     try:
         write_pending(
             task_desc=instruction,
@@ -247,3 +275,64 @@ def _persist(instruction: str, task_plan: dict, code: str, api_names: list) -> N
         )
     except Exception:
         pass
+
+
+def _oracle_failure_summary(verdict: dict) -> str:
+    """Extract the expected-vs-actual diff from an oracle verdict."""
+    failures = verdict.get("failures", [])
+    if not failures:
+        return "Oracle failed."
+    parts = []
+    for f in failures[:2]:
+        trace = f.get("trace", "")
+        if "Original values:" in trace:
+            parts.append(trace[trace.index("Original values:"):trace.index("Original values:") + 500])
+        elif "AssertionError" in trace:
+            parts.append(trace[trace.index("AssertionError"):trace.index("AssertionError") + 400])
+        elif trace:
+            parts.append(trace[:300])
+    return "\n".join(parts) or "Oracle failed."
+
+
+def _oracle_repair_loop(
+    ctx, task_plan: dict, docs_str: str, tokens: dict,
+    code: str, instruction: str, api_names: list,
+) -> None:
+    """Oracle-guided repair: up to 3 checks, 2 repair attempts. Persists only on oracle pass."""
+    for attempt in range(3):
+        _persist(instruction, task_plan, code, api_names)
+        try:
+            verdict = ctx.evaluate_full()
+        except Exception as e:
+            log.error("Oracle verify", str(e))
+            discard_pending()
+            return
+
+        passed = verdict.get("success", False)
+        log.oracle_result(passed)
+
+        if passed:
+            confirm_pending_success()
+            return
+
+        discard_pending()
+
+        if attempt >= 2:
+            return
+
+        # Oracle-guided repair: lightweight prompt with expected-vs-actual diff only.
+        # Intentionally avoids full docs to stay within the token budget.
+        oracle_error = _oracle_failure_summary(verdict)
+        log.info("Oracle repair", f"attempt {attempt + 1}/2 — {oracle_error[:120]}")
+        try:
+            code = generate_oracle_repair(ctx, task_plan, code, oracle_error)
+            if not code.strip():
+                return
+            preamble = make_preamble(tokens)
+            stdout = run_code(ctx, preamble + code)
+            new_answer = extract_answer_from_stdout(stdout)
+            log.exec_result(stdout)
+            complete_task(ctx, new_answer)
+        except Exception as e:
+            log.error("Oracle repair", str(e))
+            return

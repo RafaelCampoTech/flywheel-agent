@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+def make_preamble(tokens: dict) -> str:
+    return f"tokens = {repr(tokens)}\n"
+
 
 def run_code(ctx, code: str) -> str:
     """Execute Python code via MCP run_code. Returns stdout string."""

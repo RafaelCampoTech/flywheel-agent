@@ -5,7 +5,7 @@ from __future__ import annotations
 import agent.logger as log
 from agent.codegen import generate_repair
 from agent.evaluation import evaluate, has_error
-from agent.execution import run_code
+from agent.execution import make_preamble, run_code
 
 
 def repair_loop(
@@ -16,6 +16,7 @@ def repair_loop(
     failed_code: str,
     first_error: str,
     timer,
+    max_attempts: int = 3,
 ) -> tuple[str | None, str, dict | None]:
     """Run up to 3 repair attempts, time-gated by timer.
 
@@ -28,7 +29,7 @@ def repair_loop(
     last_eval: dict | None = None
     last_stdout = first_error
 
-    for attempt in range(3):
+    for attempt in range(max_attempts):
         if not timer.should_attempt_repair(attempt):
             break
 
@@ -45,7 +46,7 @@ def repair_loop(
         )
         log.codegen_result(f"repair-{attempt + 1}", fixed_code)
 
-        preamble = f"tokens = {repr(tokens)}\n"
+        preamble = make_preamble(tokens)
         stdout = run_code(ctx, preamble + fixed_code)
         last_stdout = stdout
         log.exec_result(stdout)
